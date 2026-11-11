@@ -10,9 +10,9 @@ class Critic(nn.Module):
         
         self.net = nn.Sequential(
             nn.Linear(state_dim, hidden_dim),
-            nn.Relu(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, hidden_dim),
-            nn.Relu(),
+            nn.ReLU(),
             nn.Linear(hidden_dim, 1)
         )
     
