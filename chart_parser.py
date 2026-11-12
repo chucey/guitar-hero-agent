@@ -9,6 +9,7 @@ Supports:
 
 Intentionally does not support open notes, drums, taps/HOPO semantics, solos, star power, or other instrument tracks in this starter version.
 """
+
 from collections import defaultdict
 from pathlib import Path
 import re
