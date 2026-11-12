@@ -220,3 +220,4 @@ __marimo__/
 .streamlit/secrets.toml
 
 songs/
+test_chart_parser2.py
