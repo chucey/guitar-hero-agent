@@ -31,8 +31,7 @@ class Config:
         self.image_model = {
             "input_shape": (12, 192, 128),  # a stack of 4 images, each with 3 channels (RGB)
             "num_actions": 6,  # number of possible actions (5 frets + strum)
-            "actor_save_dir": os.path.join("models", "vision", "actor", "vision_actor.pth"),
-            "critic_save_dir": os.path.join("models", "vision", "critic", "vision_critic.pth"),
+            
         }
 
         self.chart_model = {
