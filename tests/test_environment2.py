@@ -62,5 +62,47 @@ class TechniqueInputTests(unittest.TestCase):
         self.assertEqual(info["combo"], 1)
 
 
+class SegmentBoundaryTests(unittest.TestCase):
+    def test_segment_starts_do_not_begin_inside_an_existing_sustain(self):
+        song = [
+            Note(
+                time=1.0,
+                frets=(True, False, False, False, False),
+                durations=(5.0, 0, 0, 0, 0),
+                technique=NoteTechnique.STRUM,
+            ),
+            Note(
+                time=2.0,
+                frets=(False, True, False, False, False),
+                durations=(0, 0, 0, 0, 0),
+                technique=NoteTechnique.STRUM,
+            ),
+        ]
+        env = GuitarHeroEnv(song, segment_seconds=0.9)
+
+        env.reset(seed=0)
+
+        self.assertEqual(env.start_time, 1.0)
+        self.assertEqual(len(env.notes), 1)
+        self.assertEqual(env.notes[0]["time"], 1.0)
+
+    def test_segment_sustain_is_clipped_at_segment_end(self):
+        song = [
+            Note(
+                time=1.0,
+                frets=(True, False, False, False, False),
+                durations=(5.0, 0, 0, 0, 0),
+                technique=NoteTechnique.STRUM,
+            ),
+        ]
+        env = GuitarHeroEnv(song, segment_seconds=1.0)
+
+        env.reset(seed=0)
+
+        self.assertEqual(env.start_time, 1.0)
+        self.assertEqual(env.end_time, 2.0)
+        self.assertEqual(env.notes[0]["durations"][0], 1.0)
+
+
 if __name__ == "__main__":
     unittest.main()

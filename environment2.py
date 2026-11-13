@@ -49,7 +49,7 @@ class GuitarHeroEnv(gym.Env):
         # The first five bits are persistent desired fret states.
         # The sixth bit is a one-step strum pulse (1 on this step = strum now).
         self.action_space = spaces.MultiBinary(6)
-
+        self.screen_shape = (192, 128, 3)  # RGB image of the note highway
         self.observation_space = spaces.Dict({
             "upcoming_notes": spaces.Box(
                                 low=-1.0,
@@ -69,16 +69,23 @@ class GuitarHeroEnv(gym.Env):
             ),
             "screen": spaces.Box(
                 low=0, high=255,
-                shape=(96, 64, 3), dtype=np.uint8
+                shape=self.screen_shape, dtype=np.uint8
             ),
         })
         self.reset()
 
-    def _make_note_state(self, note):
+    def _make_note_state(self, note, segment_end=None):
+        durations = np.asarray(note.durations, dtype=np.float32)
+        if segment_end is not None:
+            durations = np.minimum(
+                durations,
+                max(0.0, float(segment_end - note.time)),
+            )
+
         return {
             "time": note.time,
             "frets": np.asarray(note.frets, dtype=np.int8),
-            "durations": np.asarray(note.durations, dtype=np.float32),
+            "durations": durations,
             "technique": note.technique,
             "is_open": note.is_open,
             "hit": False,
@@ -104,31 +111,32 @@ class GuitarHeroEnv(gym.Env):
                 + self.hit_window
                 + self.dt
             )
+            segment_end = None
         else:
-            max_start = max(0.0, self.song[-1].time - self.segment_seconds)
-            self.start_time = float(self.np_random.uniform(0.0, max_start)) if max_start > 0 else 0.0
+            valid_starts = [
+                n.time
+                for n in self.song
+                if not any(
+                    previous.time < n.time
+                    < previous.time + max(previous.durations)
+                    for previous in self.song
+                )
+            ]
+            self.start_time = float(
+                self.np_random.choice(valid_starts)
+            )
             self.end_time = self.start_time + self.segment_seconds
+            segment_end = self.end_time
         self.time = self.start_time
 
         self.notes = [
-            self._make_note_state(n)
+            self._make_note_state(n, segment_end)
             for n in self.song
             if self.start_time <= n.time <= self.end_time
             ]
 
         if not self.notes:
-            self.start_time = 0.0
-            self.end_time = (
-                max(n.time + max(n.durations) for n in self.song)
-                + self.hit_window
-                + self.dt
-            )
-            self.time = 0.0
-
-            self.notes = [
-                self._make_note_state(n)
-                for n in self.song
-            ]
+            raise RuntimeError("Selected segment contains no notes")
 
         return self._get_observation(), self._info()
     
@@ -399,10 +407,20 @@ class GuitarHeroEnv(gym.Env):
         }
 
     def _render_small(self):
-        """Tiny synthetic RGB note highway, 96x64. Not a Clone Hero screenshot."""
-        img = np.zeros((96, 64, 3), dtype=np.uint8)
+        """Tiny synthetic RGB note highway. Not a Clone Hero screenshot."""
+        height, width, _ = self.screen_shape
+        img = np.zeros(self.screen_shape, dtype=np.uint8)
         img[:] = (12, 15, 22)
-        lane_x = [8, 20, 32, 44, 56]
+        center_x = width // 2
+        lane_spacing = width // 8
+        lane_x = [
+            center_x + (fret - 2) * lane_spacing
+            for fret in range(5)
+        ]
+        hit_y = int(height * 0.8125)
+        highway_left = lane_x[0] - lane_spacing // 2
+        highway_right = lane_x[-1] + lane_spacing // 2
+        pixels_per_second = 30.0 * height / 96.0
         colors = [
             (30, 220, 70),
             (220, 40, 40),
@@ -418,29 +436,34 @@ class GuitarHeroEnv(gym.Env):
             (115, 60, 12),
         ]
         # Hit line
-        img[78:81, 3:62] = (220, 220, 220)
+        img[hit_y:hit_y + 4, highway_left:highway_right + 1] = (
+            220, 220, 220
+        )
         # Lane separators
-        for x in [14, 26, 38, 50]:
+        for left, right in zip(lane_x, lane_x[1:]):
+            x = (left + right) // 2
             img[:, x:x+1] = (45, 48, 58)
         # Notes projected onto the highway
         for n in self.notes:
             if n["hit"] or n["missed"]:
                 continue
-            y = int(78 - (n["time"] - self.time) * 30)
-            if -5 <= y <= 95:
+            y = int(hit_y - (n["time"] - self.time) * pixels_per_second)
+            if -5 <= y < height:
                 for fret, active in enumerate(n["frets"]):
                     if active:
-                        x_start = lane_x[fret] - 2
-                        x_end = lane_x[fret] + 3
-                        tail_end = int(y + n["durations"][fret] * 30)
+                        x_start = lane_x[fret] - 3
+                        x_end = lane_x[fret] + 4
+                        tail_end = int(
+                            y + n["durations"][fret] * pixels_per_second
+                        )
                         tail_start = max(0, y)
-                        tail_end = min(95, tail_end)
+                        tail_end = min(height - 1, tail_end)
                         if tail_end > tail_start:
                             img[tail_start:tail_end + 1, x_start:x_end] = (
                                 sustain_colors[fret]
                             )
 
-                        img[max(0, y-2):min(96, y+3), lane_x[fret]-3:lane_x[fret]+4] = (
+                        img[max(0, y-2):min(height, y+3), lane_x[fret]-4:lane_x[fret]+5] = (
                             colors[fret]
                         )
 
@@ -448,18 +471,23 @@ class GuitarHeroEnv(gym.Env):
         for sustain in self.active_sustains:
             fret = sustain["fret"]
             tail_end = min(
-                95,
-                int(78 + max(0.0, sustain["end_time"] - self.time) * 30),
+                height - 1,
+                int(
+                    hit_y
+                    + max(0.0, sustain["end_time"] - self.time)
+                    * pixels_per_second
+                ),
             )
-            if tail_end > 78:
-                img[81:tail_end + 1, lane_x[fret]-2:lane_x[fret]+3] = (
+            if tail_end > hit_y:
+                img[hit_y + 4:tail_end + 1, lane_x[fret]-3:lane_x[fret]+4] = (
                     sustain_colors[fret]
                 )
 
         # Current held frets shown at bottom
+        held_top = hit_y + 8
         for i, held in enumerate(self.current_frets):
             if held:
-                img[84:94, lane_x[i]-4:lane_x[i]+5] = colors[i]
+                img[held_top:height - 4, lane_x[i]-5:lane_x[i]+6] = colors[i]
         return img
 
     def render(self):
