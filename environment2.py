@@ -74,11 +74,18 @@ class GuitarHeroEnv(gym.Env):
         })
         self.reset()
 
-    def _make_note_state(self, note):
+    def _make_note_state(self, note, segment_end=None):
+        durations = np.asarray(note.durations, dtype=np.float32)
+        if segment_end is not None:
+            durations = np.minimum(
+                durations,
+                max(0.0, float(segment_end - note.time)),
+            )
+
         return {
             "time": note.time,
             "frets": np.asarray(note.frets, dtype=np.int8),
-            "durations": np.asarray(note.durations, dtype=np.float32),
+            "durations": durations,
             "technique": note.technique,
             "is_open": note.is_open,
             "hit": False,
@@ -104,31 +111,32 @@ class GuitarHeroEnv(gym.Env):
                 + self.hit_window
                 + self.dt
             )
+            segment_end = None
         else:
-            max_start = max(0.0, self.song[-1].time - self.segment_seconds)
-            self.start_time = float(self.np_random.uniform(0.0, max_start)) if max_start > 0 else 0.0
+            valid_starts = [
+                n.time
+                for n in self.song
+                if not any(
+                    previous.time < n.time
+                    < previous.time + max(previous.durations)
+                    for previous in self.song
+                )
+            ]
+            self.start_time = float(
+                self.np_random.choice(valid_starts)
+            )
             self.end_time = self.start_time + self.segment_seconds
+            segment_end = self.end_time
         self.time = self.start_time
 
         self.notes = [
-            self._make_note_state(n)
+            self._make_note_state(n, segment_end)
             for n in self.song
             if self.start_time <= n.time <= self.end_time
             ]
 
         if not self.notes:
-            self.start_time = 0.0
-            self.end_time = (
-                max(n.time + max(n.durations) for n in self.song)
-                + self.hit_window
-                + self.dt
-            )
-            self.time = 0.0
-
-            self.notes = [
-                self._make_note_state(n)
-                for n in self.song
-            ]
+            raise RuntimeError("Selected segment contains no notes")
 
         return self._get_observation(), self._info()
     
