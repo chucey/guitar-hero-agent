@@ -36,6 +36,8 @@ if __name__ == "__main__":
     num_actions = 6  # Number of possible actions
     model = VisionActor(input_shape, num_actions)
     print(model)
+    logits = model(torch.randn(1, *input_shape))  # Batch size of 1
+    print("Logits:", logits)
 
        
 

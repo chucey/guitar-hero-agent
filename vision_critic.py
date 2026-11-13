@@ -29,3 +29,11 @@ class VisionCritic(nn.Module):
         x = F.relu(self.fc1(x))
         x = self.fc2(x)
         return x
+
+if __name__ == "__main__":
+    # Example usage
+    input_shape = (4, 96, 64)  # 4 stacked frames of size 84x84
+    model = VisionCritic(input_shape)
+    print(model)
+    value_estimate = model(torch.randn(1, *input_shape))  # Batch size of 1
+    print("Value Estimate:", value_estimate)
