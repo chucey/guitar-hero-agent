@@ -1,6 +1,6 @@
 import time
 import torch
-from Train import train_ppo
+from PPOAgent import train_ppo
 from note import Note
 from environment import GuitarHeroEnv
 import gymnasium as gym
@@ -37,7 +37,7 @@ agent_kwargs = {
         }
 
 env = GuitarHeroEnv(song, render_mode="rgb_array")
-env = FilterObservation(env, filter_keys=["upcoming_notes", "note_mask", "current_frets", "active_sustains", "game_stats"])
+env = FilterObservation(env, filter_keys=["upcoming_notes", "current_frets", "active_sustains"])
 env = FlattenObservation(env=env)
     
 start_time = time.time()
