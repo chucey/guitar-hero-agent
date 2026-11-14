@@ -286,10 +286,13 @@ class PPOTrainer:
         self.monitor = monitor
         self.agent_kwargs = agent_kwargs
 
-    def train(self, env, n_iterations, eval_frequency, eval_episodes, monitor, **agent_kwargs):
+    def train(self, n_iterations, eval_frequency, eval_episodes, **agent_kwargs):
         """
         Training loop for PPO agent.
         """
+        env = self.env
+        monitor = self.monitor
+        agent_kwargs = {**self.agent_kwargs, **agent_kwargs}
         device = agent_kwargs.get("device", "cpu")
         vision = agent_kwargs.get("vision", False)
         use_wandb = agent_kwargs.pop("use_wandb", True)
@@ -523,6 +526,7 @@ class PPOTrainer:
                 # Save best model
                 if eval_reward > best_eval_reward:
                     best_eval_reward = eval_reward
+                    torch.save(agent.actor_critic.state_dict(), cf.image_model["save_dir"] if vision else cf.chart_model["save_dir"])
                 
                 if monitor:
                     avg_reward = np.mean(training_metrics["episode_reward"])
