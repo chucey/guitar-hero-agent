@@ -5,7 +5,7 @@ import os
 
 class Config:
     def __init__(self):
-        self.charts_path = None  # Path to the chart files
+        self.charts_path = os.path.join(os.getcwd(), 'songs')  # Path to the chart files
 
         # Weights and Biases
         ## Peter please change the agent name to your agent name.
@@ -27,9 +27,9 @@ class Config:
 
         # global model parameters
         self.actor_lr = 1e-4
-        self.epochs = 1000
+        self.epochs = 5
         self.actor_lr_decay = 0.99
-        self.batch_size = 64
+        self.batch_size = 32
 
         # specific model parameters
         self.image_model = {
@@ -43,6 +43,8 @@ class Config:
             "num_actions": 6,  # number of possible actions
             "save_dir": os.path.join("models", "chart", "chart_actor_critic.pth"), # <----- Assuming the two models have been combined
         }
+
+    
 
 
 
