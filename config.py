@@ -31,7 +31,7 @@ class Config:
         }
 
         self.chart_model = {
-            "input_shape": None,  # <---- PLEASE CHANGE THIS
+            "input_shape": self.lookahead * 15 + 15,  #upcoming_notes + current_frets + active_sustains
             "num_actions": 6,  # number of possible actions
             "save_dir": os.path.join("models", "chart", "chart_actor_critic.pth"), # <----- Assuming the two models have been combined
         }
