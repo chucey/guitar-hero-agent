@@ -7,6 +7,14 @@ class Config:
     def __init__(self):
         self.charts_path = None  # Path to the chart files
 
+        # Weights and Biases
+        ## Peter please change the agent name to your agent name.
+        self.agent_name = "vision_actor_critic" # name that will be used for the wandb run can be either "vision_actor_critic" or "chart_actor_critic"
+        
+        self.wandb_entity = "DS-551"
+        self.project_name = "guitar-hero-agent"
+        self.name = f"{self.agent_name}"  # Name of the run in Weights and Biases 
+
         # environment parameters
         self.dt = 0.02  # seconds per step
         self.hit_window = 0.10  # seconds

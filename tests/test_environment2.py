@@ -40,6 +40,55 @@ class ActiveSustainTests(unittest.TestCase):
         reward = env._process_sustains()
         self.assertAlmostEqual(reward, 0.025)
 
+    def test_sustain_metrics_report_full_completion(self):
+        song = [
+            Note(
+                time=1.0,
+                frets=(True, False, False, False, False),
+                durations=(1.0, 0, 0, 0, 0),
+                technique=NoteTechnique.STRUM,
+            ),
+        ]
+        env = GuitarHeroEnv(song, dt=0.5)
+        env.reset()
+        env.time = 1.0
+        env._register_hit(env.notes[0])
+        env.current_frets[0] = 1
+        env._process_sustains()
+        env.time = 1.5
+        env._process_sustains()
+
+        info = env._info()
+        self.assertEqual(info["sustain_required_seconds"], 1.0)
+        self.assertEqual(info["sustain_held_seconds"], 1.0)
+        self.assertEqual(info["sustain_accuracy"], 1.0)
+        self.assertEqual(info["sustain_completion"], 1.0)
+
+    def test_sustain_metrics_reflect_releasing_a_sustain_early(self):
+        song = [
+            Note(
+                time=1.0,
+                frets=(True, False, False, False, False),
+                durations=(1.0, 0, 0, 0, 0),
+                technique=NoteTechnique.STRUM,
+            ),
+        ]
+        env = GuitarHeroEnv(song, dt=0.5)
+        env.reset()
+        env.time = 1.0
+        env._register_hit(env.notes[0])
+        env.current_frets[0] = 1
+        env._process_sustains()
+        env.time = 1.5
+        env.current_frets[0] = 0
+        env._process_sustains()
+
+        info = env._info()
+        self.assertEqual(info["sustain_required_seconds"], 1.0)
+        self.assertEqual(info["sustain_held_seconds"], 0.5)
+        self.assertEqual(info["sustain_accuracy"], 0.5)
+        self.assertEqual(info["sustain_completion"], 0.5)
+
 
 class TechniqueInputTests(unittest.TestCase):
     def test_first_hopo_can_be_hit_without_an_existing_combo(self):

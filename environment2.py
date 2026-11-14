@@ -102,6 +102,9 @@ class GuitarHeroEnv(gym.Env):
         self.wrong_strums = 0
         self.current_frets = np.zeros(5, dtype=np.int8)
         self.active_sustains = []
+        self.sustain_seconds_required = 0.0
+        self.sustain_seconds_hit_required = 0.0
+        self.sustain_seconds_held = 0.0
         self.steps = 0
 
         if self.segment_seconds is None or self.segment_seconds <= 0:
@@ -138,7 +141,36 @@ class GuitarHeroEnv(gym.Env):
         if not self.notes:
             raise RuntimeError("Selected segment contains no notes")
 
+        self.sustain_seconds_required = self._calculate_sustain_seconds(
+            self.notes
+        )
         return self._get_observation(), self._info()
+
+    @staticmethod
+    def _calculate_sustain_seconds(notes):
+        intervals_by_fret = [[] for _ in range(5)]
+        for note in notes:
+            for fret, duration in enumerate(note["durations"]):
+                if duration > 0:
+                    intervals_by_fret[fret].append(
+                        (note["time"], note["time"] + float(duration))
+                    )
+
+        total = 0.0
+        for intervals in intervals_by_fret:
+            current_start = None
+            current_end = None
+            for start, end in sorted(intervals):
+                if current_start is None:
+                    current_start, current_end = start, end
+                elif start <= current_end:
+                    current_end = max(current_end, end)
+                else:
+                    total += current_end - current_start
+                    current_start, current_end = start, end
+            if current_start is not None:
+                total += current_end - current_start
+        return total
     
     def _start_sustains(self, note):
         for fret, duration in enumerate(note["durations"]):
@@ -159,8 +191,13 @@ class GuitarHeroEnv(gym.Env):
                 None,
             )
             if existing is not None:
+                previous_end_time = existing["end_time"]
                 existing["end_time"] = max(existing["end_time"], end_time)
                 existing["paid_until"] = max(existing["paid_until"], self.time)
+                self.sustain_seconds_hit_required += max(
+                    0.0,
+                    existing["end_time"] - previous_end_time,
+                )
                 continue
 
             self.active_sustains.append({
@@ -168,6 +205,7 @@ class GuitarHeroEnv(gym.Env):
                 "end_time": end_time,
                 "paid_until": self.time,
             })
+            self.sustain_seconds_hit_required += end_time - self.time
 
     def step(self, action):
         if not self.action_space.contains(action):
@@ -302,6 +340,7 @@ class GuitarHeroEnv(gym.Env):
             reward += (
                 elapsed * self.sustain_reward_per_second
             )
+            self.sustain_seconds_held += elapsed
 
             sustain["paid_until"] = until
 
@@ -395,6 +434,21 @@ class GuitarHeroEnv(gym.Env):
 
     def _info(self):
         total = max(len(self.notes), 1)
+        if self.sustain_seconds_required > 0:
+            sustain_coverage = (
+                self.sustain_seconds_held
+                / self.sustain_seconds_required
+            )
+            sustain_completion = (
+                self.sustain_seconds_held
+                / self.sustain_seconds_hit_required
+                if self.sustain_seconds_hit_required > 0
+                else 0.0
+            )
+        else:
+            sustain_coverage = 1.0
+            sustain_completion = 1.0
+
         return {
             "score": int(self.score),
             "combo": int(self.combo),
@@ -403,6 +457,11 @@ class GuitarHeroEnv(gym.Env):
             "notes_missed": int(self.notes_missed),
             "wrong_strums": int(self.wrong_strums),
             "accuracy": float(self.notes_hit / total),
+            "sustain_accuracy": float(sustain_coverage),
+            "sustain_coverage": float(sustain_coverage),
+            "sustain_completion": float(sustain_completion),
+            "sustain_required_seconds": float(self.sustain_seconds_required),
+            "sustain_held_seconds": float(self.sustain_seconds_held),
             "time": float(self.time),
         }
 

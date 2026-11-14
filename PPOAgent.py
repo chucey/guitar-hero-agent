@@ -1,11 +1,13 @@
 from chart_actor_critic import ChartActorCritic
 from vision_actor_critic import VisionActorCritic
+from prep_input import make_chart_env, make_vision_env, prep_chart_input, prep_vision_input
 import torch
 import torch.nn as nn
 import numpy as np
 import gymnasium as gym
 import time
 from typing import Tuple, List
+import wandb
 
 class PPOAgent:
         def __init__(self, 
@@ -25,7 +27,8 @@ class PPOAgent:
                      batch_size: int = 64, 
                      n_epochs: int = 10,
                      device: str = "cpu"):
-                    
+
+                    self.vision = vision
                     self.gamma = gamma
                     self.gae_lambda = gae_lambda
                     self.kl_coef = kl_coef
@@ -55,14 +58,32 @@ class PPOAgent:
                     self.values = []
                     self.log_probs = []
 
-        def select_action(self, state: np.ndarray) -> Tuple[int, float, float]:
+        def _prepare_state(self, state):
+                if self.vision:
+                    if not isinstance(state, dict):
+                        raise TypeError("vision observations must be dictionaries")
+                    return prep_vision_input(state).to(self.device)
+
+                if isinstance(state, dict):
+                    return prep_chart_input(state).to(self.device)
+
+                state_tensor = torch.as_tensor(
+                    state,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+                if state_tensor.ndim == 1:
+                    state_tensor = state_tensor.unsqueeze(0)
+                return state_tensor
+
+        def select_action(self, state: np.ndarray) -> Tuple[torch.tensor, float, float]:
                 """Select action and return action, log prob, and value."""
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+                state_tensor = self._prepare_state(state)
                 
                 with torch.no_grad():
                     action_logits, value = self.actor_critic(state_tensor)
                     distribution = torch.distributions.Bernoulli(logits=action_logits)
-                    action_tensor = distribution.sample()
+                    action_tensor = distribution.sample().bool()
                     log_prob = distribution.log_prob(action_tensor).sum(dim=-1)
 
                 action = action_tensor.squeeze(0).cpu().numpy()
@@ -113,7 +134,7 @@ class PPOAgent:
                 """Update actor and critic networks using collected rollout data."""
                 # Estimate the value of the state 
                 with torch.no_grad():
-                    next_state_tensor = torch.FloatTensor(next_state).unsqueeze(0).to(self.device)
+                    next_state_tensor = self._prepare_state(next_state)
                     _, last_value_tensor = self.actor_critic(next_state_tensor)
                     last_value = last_value_tensor.item()
 
@@ -124,7 +145,10 @@ class PPOAgent:
                 advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
                 # Convert buffer and gae outputs
-                states_t = torch.FloatTensor(np.array(self.states)).to(self.device)
+                states_t = torch.cat(
+                    [self._prepare_state(state) for state in self.states],
+                    dim=0,
+                )
                 actions_t = torch.FloatTensor(np.array(self.actions)).to(self.device)
                 old_log_probs_t = torch.FloatTensor(np.array(self.log_probs)).to(self.device)
                 advantages_t = torch.FloatTensor(advantages).to(self.device)
@@ -164,8 +188,17 @@ class PPOAgent:
                         with torch.no_grad():
                             clip_frac = ((ratio - 1.0).abs() > self.clip_eps).float().mean().item()
 
-                        # Compute network losses
-                        actor_loss = -(ratio * advantages_t[mb_idx]).mean() + self.kl_coef * approx_kl
+                        # Compute the clipped PPO surrogate objective.
+                        surrogate_1 = ratio * advantages_t[mb_idx]
+                        surrogate_2 = torch.clamp(
+                            ratio,
+                            1.0 - self.clip_eps,
+                            1.0 + self.clip_eps,
+                        ) * advantages_t[mb_idx]
+                        actor_loss = -torch.min(
+                            surrogate_1,
+                            surrogate_2,
+                        ).mean() + self.kl_coef * approx_kl
                         critic_loss = self.vf_coef * nn.functional.mse_loss(new_values, returns_t[mb_idx])
                         total_loss = actor_loss + critic_loss - 0.01 * entropy
 
@@ -183,16 +216,23 @@ class PPOAgent:
                         total_clip_frac += clip_frac
                         num_updates += 1
 
-                        # Adjust KL penalty coefficient based on mean KL
-                        mean_kl = total_kl / max(1, num_updates)
-                        if mean_kl < self.target_kl / 1.5:
-                            self.kl_coef /= 2.0
-                        elif mean_kl > self.target_kl * 1.5:
-                            self.kl_coef *= 2.0
+                # Adjust the KL penalty coefficient once per PPO update.
+                mean_kl = total_kl / max(1, num_updates)
+                if mean_kl < self.target_kl / 1.5:
+                    self.kl_coef = max(self.kl_coef / 2.0, 1e-4)
+                elif mean_kl > self.target_kl * 1.5:
+                    self.kl_coef = min(self.kl_coef * 2.0, 10.0)
 
-                # explained variance
+                # Measure critic quality using predictions after optimization.
+                with torch.no_grad():
+                    updated_values = self.actor_critic(states_t)[1].squeeze(-1)
+                updated_values = updated_values.cpu().numpy()
                 ret_var = np.var(returns)
-                explained_var = float(1.0 - np.var(returns - np.array(self.values)) / (ret_var + 1e-8))
+                explained_var = float(
+                    1.0
+                    - np.var(returns - updated_values)
+                    / (ret_var + 1e-8)
+                )
 
                 # clear buffer for next iteration
                 self.clear_buffer()
@@ -203,137 +243,239 @@ class PPOAgent:
                         "policy_entropy": total_entropy / max(1, num_updates),
                         "approx_kl": total_kl / max(1, num_updates),
                         "clip_fraction": total_clip_frac / max(1, num_updates),
-                        "explained_variance": explained_var
+                        "explained_variance": explained_var,
+                        "kl_coef": self.kl_coef,
+                        "learning_rate": self.actor_critic_optimizer.param_groups[0]["lr"],
                         }
 
+        def evaluate(self, env, n_episodes):
+                """Evaluate the policy deterministically and return mean reward."""
+                rewards = []
+
+                for _ in range(n_episodes):
+                        state, _ = env.reset()
+                        done = False
+                        total_reward = 0.0
+
+                        while not done:
+                                state_tensor = self._prepare_state(state)
+
+                                with torch.no_grad():
+                                        logits, _ = self.actor_critic(state_tensor)
+                                        action = (
+                                                (logits > 0.0)
+                                                .squeeze(0)
+                                                .cpu()
+                                                .numpy()
+                                        )
+
+                                state, reward, terminated, truncated, _ = env.step(action)
+                                done = terminated or truncated
+                                total_reward += reward
+
+                        rewards.append(total_reward)
+
+                return float(np.mean(rewards))
 
 
+class PPOTrainer:
+    """Orchestrates environment interaction, PPO updates, evaluation, and logging."""
 
-def test_ppo(agent, env, n_episodes, render = False, device = "cpu"):
-    """
-    Evaluate PPO agent.
-    """
-    rewards = []
-    vision = getattr(agent, "vision") 
-    
-    for _ in range(n_episodes):
-        state, _ = env.reset()
-        done = False
-        total_reward = 0
+    def __init__(self, env, monitor=False, **agent_kwargs):
+        self.env = env
+        self.monitor = monitor
+        self.agent_kwargs = agent_kwargs
+
+    def train(self, env, n_iterations, eval_frequency, eval_episodes, monitor, **agent_kwargs):
+        """
+        Training loop for PPO agent.
+        """
+        device = agent_kwargs.get("device", "cpu")
+        vision = agent_kwargs.get("vision", False)
+        use_wandb = agent_kwargs.pop("use_wandb", True)
+        wandb_run = agent_kwargs.pop("wandb_run", None)
+        wandb_project = agent_kwargs.pop("wandb_project", "guitar-hero-agent")
+        wandb_entity = agent_kwargs.pop("wandb_entity", None)
+        wandb_name = agent_kwargs.pop("wandb_name", None)
         
-        while not done:
-            if vision:
-                state_tensor = torch.as_tensor(state, device=device) #(C, H, W)
-                state_tensor = state_tensor / 255 #normalize
-                state_tensor = state_tensor.unsqueeze(0)  #(1, C, H, W)
+        if vision:
+            if isinstance(env.observation_space, gym.spaces.Dict):
+                screen_shape = env.observation_space["screen"].shape
+                if len(screen_shape) == 3:
+                    env = make_vision_env(env, stack_size=4)
+            screen_shape = env.observation_space["screen"].shape
+            if len(screen_shape) != 4:
+                raise ValueError(
+                    "vision environment must provide four stacked channel-first frames"
+                )
+            state_dim = (
+                screen_shape[0] * screen_shape[1],
+                screen_shape[2],
+                screen_shape[3],
+            )
+        elif isinstance(env.observation_space, gym.spaces.Dict):
+            env = make_chart_env(env)
 
-            else:
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
-            
-            with torch.no_grad():
-                logits, _ = agent.actor_critic(state_tensor)
-                action = action = (logits > 0.0).squeeze(0).cpu().numpy()
-            
-            state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            total_reward += reward
+        # Get state and action dimensions
+        if not vision:
+            state_dim = env.observation_space.shape[0]
+
+        action_dim = env.action_space.shape[0]
         
-        rewards.append(total_reward)
-    
-    return float(np.mean(rewards))
+        # Initialize agent
+        agent = PPOAgent(
+            state_dim=state_dim,
+            action_dim=action_dim,
+            **agent_kwargs
+            )
 
-
-def train_ppo(env, n_iterations, eval_frequency, eval_episodes, monitor, **agent_kwargs):
-    """
-    Training loop for PPO agent.
-    """
-    device = agent_kwargs.get("device", "cpu")
-    vision = agent_kwargs.get("vision", False)
-    
-    # Get state and action dimensions
-    if vision:
-        state_dim = env.observation_space.shape
-    else:
-        state_dim = env.observation_space.shape[0]
-
-    action_dim = env.action_space.shape[0]
-    
-    # Initialize agent
-    agent = PPOAgent(
-        state_dim=state_dim,
-        action_dim=action_dim,
-        **agent_kwargs
-        )
-    
-    training_metrics = {
-        # Gameplay (logged per episode)
-        "episode_reward": [],
-        "note_accuracy": [],
-        "game_score": [],
-        "max_combo": [],
-        "wrong_strums_per_100_notes": [],
-        "sustain_completion": [],
-
-        # PPO diagnostics 
-        "actor_loss": [],
-        "critic_loss": [],
-        "policy_entropy": [],
-        "approx_kl": [],
-        "clip_fraction": [],
-        "explained_variance": [],
-
-        # Efficiency 
-        "environment_steps": [],
-        "training_fps": [],
-    }
-    #tracking
-    episode_lengths = []
-    best_eval_reward = -float('inf')
-    total_env_steps = 0
-    last_update_steps = 0
-    last_update_time = time.perf_counter()
-    
-    if monitor:
-        Architecture = "VisionActorCritic" if vision else "ChartActorCritic"
-        print("=" * 80)
-        print(f"Training {Architecture} on {env}")
-        print(f"State dim: {state_dim} | Action dim: {action_dim}")
-        print(f"Device: {device}")
-        print(f"PPO params: n_steps={agent.n_steps}, n_epochs={agent.n_epochs}, batch_size={agent.batch_size}")
-        print("=" * 80)
-    
-    for iteration in range(1, n_iterations + 1):
-        state, _ = env.reset()
-        done = False
-        episode_reward = 0
-        episode_step = 0
+        owned_wandb_run = False
+        if use_wandb:
+            if wandb_run is None:
+                wandb_run = wandb.init(
+                    project=wandb_project,
+                    entity=wandb_entity,
+                    name=wandb_name,
+                    config={
+                        "vision": vision,
+                        "state_dim": state_dim,
+                        "action_dim": action_dim,
+                        **agent_kwargs,
+                    },
+                )
+                owned_wandb_run = True
         
-        # Collect rollout
-        while not done:
-            action, log_prob, value = agent.select_action(state)
-            
-            next_state, reward, terminated, truncated, info = env.step(action)
-            done = terminated or truncated
-            bootstrap_done = terminated  # Only true terminal stops bootstrap
-            
-            # Store transition
-            agent.store_transition(state, action, reward, bootstrap_done, value, log_prob)
-            
-            episode_reward += reward
-            episode_step += 1
-            total_env_steps += 1
-            
-            # Update if we have enough steps
-            if len(agent.states) >= agent.n_steps:
-                update_info = agent.update(next_state=next_state)
+        training_metrics = {
+            # Gameplay (logged per episode)
+            "episode_reward": [],
+            "note_accuracy": [],
+            "game_score": [],
+            "max_combo": [],
+            "wrong_strums": [],
+            "sustain_completion": [],
+            "episode_length": [],
 
-                #log metrics
-                training_metrics["actor_loss"].append(update_info["actor_loss"])
-                training_metrics["critic_loss"].append(update_info["critic_loss"])
-                training_metrics["policy_entropy"].append(update_info["policy_entropy"])
-                training_metrics["approx_kl"].append(update_info["approx_kl"])
-                training_metrics["clip_fraction"].append(update_info["clip_fraction"])
-                training_metrics["explained_variance"].append(update_info["explained_variance"])
+            # PPO diagnostics 
+            "actor_loss": [],
+            "critic_loss": [],
+            "policy_entropy": [],
+            "approx_kl": [],
+            "clip_fraction": [],
+            "explained_variance": [],
+
+            # Efficiency 
+            "environment_steps": [],
+            "training_fps": [],
+        }
+        #tracking
+        episode_lengths = []
+        best_eval_reward = -float('inf')
+        total_env_steps = 0
+        last_update_steps = 0
+        last_update_time = time.perf_counter()
+        training_start_time = last_update_time
+
+        def log_wandb(metrics):
+            if use_wandb and wandb_run is not None:
+                wandb_run.log(metrics)
+
+        def log_update(update_info, update_time):
+            training_metrics["actor_loss"].append(update_info["actor_loss"])
+            training_metrics["critic_loss"].append(update_info["critic_loss"])
+            training_metrics["policy_entropy"].append(update_info["policy_entropy"])
+            training_metrics["approx_kl"].append(update_info["approx_kl"])
+            training_metrics["clip_fraction"].append(update_info["clip_fraction"])
+            training_metrics["explained_variance"].append(update_info["explained_variance"])
+
+            log_wandb(
+                {
+                    "ppo/actor_loss": update_info["actor_loss"],
+                    "ppo/critic_loss": update_info["critic_loss"],
+                    "ppo/entropy": update_info["policy_entropy"],
+                    "ppo/approx_kl": update_info["approx_kl"],
+                    "ppo/clip_fraction": update_info["clip_fraction"],
+                    "ppo/explained_variance": update_info["explained_variance"],
+                    "ppo/kl_coef": update_info["kl_coef"],
+                    "ppo/learning_rate": update_info["learning_rate"],
+                    "performance/update_time_seconds": update_time,
+                },
+            )
+        
+        if monitor:
+            Architecture = "VisionActorCritic" if vision else "ChartActorCritic"
+            print("=" * 80)
+            print(f"Training {Architecture} on {env}")
+            print(f"State dim: {state_dim} | Action dim: {action_dim}")
+            print(f"Device: {device}")
+            print(f"PPO params: n_steps={agent.n_steps}, n_epochs={agent.n_epochs}, batch_size={agent.batch_size}")
+            print("=" * 80)
+        
+        for iteration in range(1, n_iterations + 1):
+            state, _ = env.reset()
+            done = False
+            episode_reward = 0
+            episode_step = 0
+            rollout_start_time = time.perf_counter()
+            
+            # Collect rollout
+            while not done:
+                action, log_prob, value = agent.select_action(state)
+                
+                next_state, reward, terminated, truncated, info = env.step(action)
+                done = terminated or truncated
+                bootstrap_done = terminated  # Only true terminal stops bootstrap
+                
+                # Store transition
+                agent.store_transition(state, action, reward, bootstrap_done, value, log_prob)
+                
+                episode_reward += reward
+                episode_step += 1
+                total_env_steps += 1
+
+                now = time.perf_counter()
+                wall_time = max(now - training_start_time, 1e-8)
+                log_wandb(
+                    {
+                        "performance/environment_steps": total_env_steps,
+                        "performance/environment_steps_per_second": total_env_steps / wall_time,
+                        "performance/episodes_per_second": (iteration - 1) / wall_time,
+                        "performance/rollout_time_seconds": now - rollout_start_time,
+                        "performance/update_time_seconds": 0.0,
+                        "performance/total_wall_time_seconds": wall_time,
+                    },
+                )
+                
+                # Update if we have enough steps
+                if len(agent.states) >= agent.n_steps:
+                    update_start_time = time.perf_counter()
+                    update_info = agent.update(next_state=next_state)
+                    update_time = time.perf_counter() - update_start_time
+                    log_update(update_info, update_time)
+
+                    now = time.perf_counter()
+                    elapsed = max(now - last_update_time, 1e-8)
+                    fps = (total_env_steps - last_update_steps) / elapsed
+
+                    training_metrics["environment_steps"].append(total_env_steps)
+                    training_metrics["training_fps"].append(fps)
+
+                    last_update_time = now
+                    last_update_steps = total_env_steps
+                    
+                    if monitor and iteration % (eval_frequency * 10) == 0:
+                        print(f"Iter {iteration:4d} | Update: Loss A: {update_info['actor_loss']:.3f}, "
+                            f"Loss C: {update_info['critic_loss']:.3f}, "
+                            f"KL: {update_info['approx_kl']:.4f}, Clip: {update_info['clip_fraction']:.3f}, "
+                            f"EV: {update_info['explained_variance']:.3f}")
+                        
+                state = next_state
+
+            # Train on any rollout transitions left after the episode ends.
+            if agent.states:
+                update_start_time = time.perf_counter()
+                update_info = agent.update(next_state=state)
+                update_time = time.perf_counter() - update_start_time
+                log_update(update_info, update_time)
 
                 now = time.perf_counter()
                 elapsed = max(now - last_update_time, 1e-8)
@@ -344,42 +486,65 @@ def train_ppo(env, n_iterations, eval_frequency, eval_episodes, monitor, **agent
 
                 last_update_time = now
                 last_update_steps = total_env_steps
+
+            #log gameplay metrics
+            episode_lengths.append(episode_step)
+            training_metrics["episode_reward"].append(episode_reward)
+            training_metrics["note_accuracy"].append(info.get("accuracy", 0.0))
+            training_metrics["game_score"].append(info.get("score", 0))
+            training_metrics["max_combo"].append(info.get("max_combo", 0))
+            training_metrics["wrong_strums"].append(info.get("wrong_strums", 0))
+            training_metrics["sustain_completion"].append(info.get("sustain_completion", 0.0))
+            training_metrics["episode_length"].append(episode_step)
+
+            recent = slice(-30, None)
+            epoch_metrics = {
+                "episode_reward/mean_30": float(np.mean(training_metrics["episode_reward"][recent])),
+                "episode_reward/max_30": float(np.max(training_metrics["episode_reward"][recent])),
+                "episode_reward/std_30": float(np.std(training_metrics["episode_reward"][recent])),
+                "accuracy/mean_30": float(np.mean(training_metrics["note_accuracy"][recent])),
+                "score/mean_30": float(np.mean(training_metrics["game_score"][recent])),
+                "max_combo/max_30": float(np.max(training_metrics["max_combo"][recent])),
+                "wrong_strum/mean_30": float(np.mean(training_metrics["wrong_strums"][recent])),
+                "wrong_strum/max_30": float(np.max(training_metrics["wrong_strums"][recent])),
+                "episode_length/mean_30": float(np.mean(episode_lengths[recent])),
+                "sustain/coverage": float(info.get("sustain_coverage", 0.0)),
+                "sustain/completion": float(info.get("sustain_completion", 0.0)),
+                "sustain/required_seconds": float(info.get("sustain_required_seconds", 0.0)),
+                "sustain/held_seconds": float(info.get("sustain_held_seconds", 0.0)),
+            }
+            log_wandb(epoch_metrics)
+
+
+            # Evaluate periodically
+            if iteration % eval_frequency == 0:
+                eval_reward = agent.evaluate(env, eval_episodes)
                 
-                if monitor and iteration % (eval_frequency * 10) == 0:
-                    print(f"Iter {iteration:4d} | Update: Loss A: {update_info['actor_loss']:.3f}, "
-                          f"Loss C: {update_info['critic_loss']:.3f}, "
-                          f"KL: {update_info['approx_kl']:.4f}, Clip: {update_info['clip_fraction']:.3f}, "
-                          f"EV: {update_info['explained_variance']:.3f}")
-                    
-            state = next_state
+                # Save best model
+                if eval_reward > best_eval_reward:
+                    best_eval_reward = eval_reward
+                
+                if monitor:
+                    avg_reward = np.mean(training_metrics["episode_reward"])
+                    avg_length = np.mean(episode_lengths[-eval_frequency:])
+                    avg_acc = np.mean(training_metrics["note_accuracy"][-eval_frequency:])
+                    print(f"Iter {iteration:4d} | Train Avg: {avg_reward:8.2f} | Acc: {avg_acc:5.1%} | "
+                        f"Eval: {eval_reward:8.2f} (Best: {best_eval_reward:8.2f}) | "
+                        f"Length: {avg_length:6.1f}")
+        
+        env.close()
+        if owned_wandb_run:
+            wandb_run.finish()
+        print(f"\nTraining completed! Best evaluation reward: {best_eval_reward:.2f}")
+        
+        return agent, training_metrics
 
-        #log gameplay metrics
-        episode_lengths.append(episode_step)
-        training_metrics["episode_reward"].append(episode_reward)
-        training_metrics["note_accuracy"].append(info.get("note_accuracy", 0.0))
-        training_metrics["game_score"].append(info.get("game_score", 0))
-        training_metrics["max_combo"].append(info.get("max_combo", 0))
-        training_metrics["wrong_strums_per_100_notes"].append(info.get("wrong_strums_per_100_notes", 0.0))
-        training_metrics["sustain_completion"].append(info.get("sustain_completion", 0.0))
 
-
-        # Evaluate periodically
-        if iteration % eval_frequency == 0:
-            eval_reward = test_ppo(agent, env, eval_episodes, device=device)
-            
-            # Save best model
-            if eval_reward > best_eval_reward:
-                best_eval_reward = eval_reward
-            
-            if monitor:
-                avg_reward = np.mean(training_metrics["episode_reward"])
-                avg_length = np.mean(episode_lengths[-eval_frequency:])
-                avg_acc = np.mean(training_metrics["note_accuracy"][-eval_frequency:])
-                print(f"Iter {iteration:4d} | Train Avg: {avg_reward:8.2f} | Acc: {avg_acc:5.1%} | "
-                      f"Eval: {eval_reward:8.2f} (Best: {best_eval_reward:8.2f}) | "
-                      f"Length: {avg_length:6.1f}")
-    
-    env.close()
-    print(f"\nTraining completed! Best evaluation reward: {best_eval_reward:.2f}")
-    
-    return agent, training_metrics
+def train_ppo(env, n_iterations, eval_frequency, eval_episodes, monitor, **agent_kwargs):
+    """Backward-compatible wrapper around :class:`PPOTrainer`."""
+    trainer = PPOTrainer(env, monitor=monitor, **agent_kwargs)
+    return trainer.train(
+        n_iterations=n_iterations,
+        eval_frequency=eval_frequency,
+        eval_episodes=eval_episodes,
+    )
