@@ -222,3 +222,4 @@ __marimo__/
 songs/
 test_chart_parser2.py
 tests/
+wandb/
