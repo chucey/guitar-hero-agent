@@ -6,7 +6,7 @@ import torch
 
 class Config:
     def __init__(self):
-        self.charts_path = os.path.join(os.getcwd(), 'songs', 'train')  # Path to the chart files
+        self.charts_path = os.path.join(os.getcwd(), 'songs')  # Path to the chart files
 
         # set device
         if torch.cuda.is_available():
