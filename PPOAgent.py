@@ -8,6 +8,9 @@ import gymnasium as gym
 import time
 from typing import Tuple, List
 import wandb
+import dotenv
+import os
+from pathlib import Path
 
 class PPOAgent:
         def __init__(self, 
@@ -83,10 +86,10 @@ class PPOAgent:
                 with torch.no_grad():
                     action_logits, value = self.actor_critic(state_tensor)
                     distribution = torch.distributions.Bernoulli(logits=action_logits)
-                    action_tensor = distribution.sample().bool()
+                    action_tensor = distribution.sample()
                     log_prob = distribution.log_prob(action_tensor).sum(dim=-1)
 
-                action = action_tensor.squeeze(0).cpu().numpy()
+                action = action_tensor.squeeze(0).bool().cpu().numpy()
                 return action, log_prob.item(), value.item()
         
 
@@ -281,20 +284,93 @@ class PPOAgent:
 class PPOTrainer:
     """Orchestrates environment interaction, PPO updates, evaluation, and logging."""
 
-    def __init__(self, env, monitor=False, **agent_kwargs):
+    def __init__(
+        self,
+        cf,
+        env,
+        agent,
+        eval_env=None,
+        monitor=False,
+        difficulty="unknown",
+        checkpoint_root="checkpoints",
+        resume_from=None,
+        checkpoint_prefix=None,
+        **agent_kwargs,
+    ):
+        self.cf = cf
         self.env = env
+        self.eval_env = eval_env
+        self.agent = agent
         self.monitor = monitor
-        self.agent_kwargs = agent_kwargs
+        self.difficulty = str(difficulty).strip().lower() or "unknown"
+        self.checkpoint_root = Path(checkpoint_root)
+        self.resume_from = resume_from
+        self.checkpoint_prefix = checkpoint_prefix
+        self.agent_kwargs = {
+            key: value for key, value in agent_kwargs.items()
+            if key != "agent"
+        }
+
+    def _checkpoint_directory(self, vision):
+        model_type = "vision" if vision else "chart"
+        return self.checkpoint_root / model_type / self.difficulty
+
+    def _save_checkpoint(
+        self,
+        path,
+        iteration,
+        total_env_steps,
+        best_eval_reward,
+    ):
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        checkpoint = {
+            "model_state_dict": self.agent.actor_critic.state_dict(),
+            "optimizer_state_dict": self.agent.actor_critic_optimizer.state_dict(),
+            "iteration": iteration,
+            "total_env_steps": total_env_steps,
+            "best_eval_reward": best_eval_reward,
+            "difficulty": self.difficulty,
+            "vision": self.agent.vision,
+            "kl_coef": self.agent.kl_coef,
+        }
+        torch.save(checkpoint, path)
+
+    def _load_checkpoint(self, path):
+        checkpoint = torch.load(path, map_location=self.agent.device)
+        self.agent.actor_critic.load_state_dict(checkpoint["model_state_dict"])
+        self.agent.actor_critic_optimizer.load_state_dict(
+            checkpoint["optimizer_state_dict"]
+        )
+        self.agent.kl_coef = checkpoint.get("kl_coef", self.agent.kl_coef)
+        return checkpoint
 
     def train(self, n_iterations, eval_frequency, eval_episodes, **agent_kwargs):
         """
         Training loop for PPO agent.
         """
         env = self.env
+        eval_envs = (
+            list(self.eval_env)
+            if isinstance(self.eval_env, (list, tuple))
+            else ([] if self.eval_env is None else [self.eval_env])
+        )
         monitor = self.monitor
         agent_kwargs = {**self.agent_kwargs, **agent_kwargs}
         device = agent_kwargs.get("device", "cpu")
-        vision = agent_kwargs.get("vision", False)
+        vision = agent_kwargs.get("vision", getattr(self.agent, "vision", False))
+        difficulty = str(
+            agent_kwargs.pop("difficulty", self.difficulty)
+        ).strip().lower() or "unknown"
+        self.difficulty = difficulty
+        checkpoint_root = Path(
+            agent_kwargs.pop("checkpoint_root", self.checkpoint_root)
+        )
+        resume_from = agent_kwargs.pop("resume_from", self.resume_from)
+        checkpoint_prefix = agent_kwargs.pop(
+            "checkpoint_prefix",
+            self.checkpoint_prefix,
+        )
         use_wandb = agent_kwargs.pop("use_wandb", True)
         wandb_run = agent_kwargs.pop("wandb_run", None)
         wandb_project = agent_kwargs.pop("wandb_project", "guitar-hero-agent")
@@ -316,24 +392,56 @@ class PPOTrainer:
                 screen_shape[2],
                 screen_shape[3],
             )
+            eval_envs = [
+                make_vision_env(eval_env, stack_size=4)
+                if isinstance(eval_env.observation_space, gym.spaces.Dict)
+                else eval_env
+                for eval_env in eval_envs
+            ]
         elif isinstance(env.observation_space, gym.spaces.Dict):
             env = make_chart_env(env)
+            eval_envs = [
+                make_chart_env(eval_env)
+                if isinstance(eval_env.observation_space, gym.spaces.Dict)
+                else eval_env
+                for eval_env in eval_envs
+            ]
 
         # Get state and action dimensions
         if not vision:
             state_dim = env.observation_space.shape[0]
 
         action_dim = env.action_space.shape[0]
+
+        checkpoint_directory = (
+            Path(checkpoint_root)
+            / ("vision" if vision else "chart")
+            / difficulty
+        )
+        
+        start_env_steps = 0
+        start_iteration = 0
+        resume_checkpoint = None
+        if resume_from is not None:
+            resume_checkpoint = self._load_checkpoint(resume_from)
+            start_env_steps = resume_checkpoint.get("total_env_steps", 0)
+            if resume_checkpoint.get("difficulty") == difficulty:
+                start_iteration = resume_checkpoint.get("iteration", 0)
+            if monitor:
+                print(f"Loaded checkpoint: {resume_from}")
         
         # Initialize agent
-        agent = PPOAgent(
-            state_dim=state_dim,
-            action_dim=action_dim,
-            **agent_kwargs
-            )
+        # agent = PPOAgent(
+        #     state_dim=state_dim,
+        #     action_dim=action_dim,
+        #     **agent_kwargs
+        #     )
 
         owned_wandb_run = False
         if use_wandb:
+            
+            dotenv.load_dotenv()
+            wandb.login(key=os.getenv("WANDB_API_KEY"))
             if wandb_run is None:
                 wandb_run = wandb.init(
                     project=wandb_project,
@@ -372,15 +480,32 @@ class PPOTrainer:
         }
         #tracking
         episode_lengths = []
-        best_eval_reward = -float('inf')
-        total_env_steps = 0
+        best_eval_reward = (
+            resume_checkpoint.get("best_eval_reward", -float("inf"))
+            if (
+                resume_checkpoint is not None
+                and resume_checkpoint.get("difficulty") == difficulty
+            )
+            else -float("inf")
+        )
+        total_env_steps = start_env_steps
         last_update_steps = 0
         last_update_time = time.perf_counter()
         training_start_time = last_update_time
 
+        def scope_metric_names(metrics):
+            scoped = {}
+            for name, value in metrics.items():
+                if "/" in name:
+                    category, metric = name.split("/", 1)
+                    scoped[f"{category}/{difficulty}/{metric}"] = value
+                else:
+                    scoped[f"{difficulty}/{name}"] = value
+            return scoped
+
         def log_wandb(metrics):
             if use_wandb and wandb_run is not None:
-                wandb_run.log(metrics)
+                wandb_run.log(scope_metric_names(metrics))
 
         def log_update(update_info, update_time):
             training_metrics["actor_loss"].append(update_info["actor_loss"])
@@ -410,10 +535,13 @@ class PPOTrainer:
             print(f"Training {Architecture} on {env}")
             print(f"State dim: {state_dim} | Action dim: {action_dim}")
             print(f"Device: {device}")
-            print(f"PPO params: n_steps={agent.n_steps}, n_epochs={agent.n_epochs}, batch_size={agent.batch_size}")
+            print(f"PPO params: n_steps={self.agent.n_steps}, n_epochs={self.agent.n_epochs}, batch_size={self.agent.batch_size}")
             print("=" * 80)
         
-        for iteration in range(1, n_iterations + 1):
+        for iteration in range(
+            start_iteration + 1,
+            start_iteration + n_iterations + 1,
+        ):
             state, _ = env.reset()
             done = False
             episode_reward = 0
@@ -422,14 +550,14 @@ class PPOTrainer:
             
             # Collect rollout
             while not done:
-                action, log_prob, value = agent.select_action(state)
+                action, log_prob, value = self.agent.select_action(state)
                 
                 next_state, reward, terminated, truncated, info = env.step(action)
                 done = terminated or truncated
                 bootstrap_done = terminated  # Only true terminal stops bootstrap
                 
                 # Store transition
-                agent.store_transition(state, action, reward, bootstrap_done, value, log_prob)
+                self.agent.store_transition(state, action, reward, bootstrap_done, value, log_prob)
                 
                 episode_reward += reward
                 episode_step += 1
@@ -449,9 +577,9 @@ class PPOTrainer:
                 )
                 
                 # Update if we have enough steps
-                if len(agent.states) >= agent.n_steps:
+                if len(self.agent.states) >= self.agent.n_steps:
                     update_start_time = time.perf_counter()
-                    update_info = agent.update(next_state=next_state)
+                    update_info = self.agent.update(next_state=next_state)
                     update_time = time.perf_counter() - update_start_time
                     log_update(update_info, update_time)
 
@@ -474,9 +602,9 @@ class PPOTrainer:
                 state = next_state
 
             # Train on any rollout transitions left after the episode ends.
-            if agent.states:
+            if self.agent.states:
                 update_start_time = time.perf_counter()
-                update_info = agent.update(next_state=state)
+                update_info = self.agent.update(next_state=state)
                 update_time = time.perf_counter() - update_start_time
                 log_update(update_info, update_time)
 
@@ -521,12 +649,52 @@ class PPOTrainer:
 
             # Evaluate periodically
             if iteration % eval_frequency == 0:
-                eval_reward = agent.evaluate(env, eval_episodes)
+                if not eval_envs:
+                    eval_reward = float("nan")
+                    if monitor:
+                        print("No held-out evaluation environment is configured.")
+                else:
+                    eval_reward = float(np.mean([
+                        self.agent.evaluate(eval_env, eval_episodes)
+                        for eval_env in eval_envs
+                    ]))
                 
                 # Save best model
-                if eval_reward > best_eval_reward:
+                if np.isfinite(eval_reward) and eval_reward > best_eval_reward:
                     best_eval_reward = eval_reward
-                    torch.save(agent.actor_critic.state_dict(), cf.image_model["save_dir"] if vision else cf.chart_model["save_dir"])
+
+                checkpoint = {
+                    "iteration": iteration,
+                    "total_env_steps": total_env_steps,
+                    "best_eval_reward": best_eval_reward,
+                }
+                prefix = (
+                    f"{checkpoint_prefix}_"
+                    if checkpoint_prefix
+                    else ""
+                )
+                iteration_path = checkpoint_directory / (
+                    f"{prefix}iteration_{iteration:06d}.pt"
+                )
+                self._save_checkpoint(
+                    iteration_path,
+                    checkpoint["iteration"],
+                    checkpoint["total_env_steps"],
+                    checkpoint["best_eval_reward"],
+                )
+                self._save_checkpoint(
+                    checkpoint_directory / "latest.pt",
+                    checkpoint["iteration"],
+                    checkpoint["total_env_steps"],
+                    checkpoint["best_eval_reward"],
+                )
+                if np.isfinite(eval_reward) and eval_reward >= best_eval_reward:
+                    self._save_checkpoint(
+                        checkpoint_directory / "best.pt",
+                        checkpoint["iteration"],
+                        checkpoint["total_env_steps"],
+                        checkpoint["best_eval_reward"],
+                    )
                 
                 if monitor:
                     avg_reward = np.mean(training_metrics["episode_reward"])
@@ -537,11 +705,13 @@ class PPOTrainer:
                         f"Length: {avg_length:6.1f}")
         
         env.close()
+        for eval_env in eval_envs:
+            eval_env.close()
         if owned_wandb_run:
             wandb_run.finish()
         print(f"\nTraining completed! Best evaluation reward: {best_eval_reward:.2f}")
         
-        return agent, training_metrics
+        return self.agent, training_metrics
 
 
 def train_ppo(env, n_iterations, eval_frequency, eval_episodes, monitor, **agent_kwargs):
