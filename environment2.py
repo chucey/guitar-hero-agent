@@ -466,19 +466,17 @@ class GuitarHeroEnv(gym.Env):
         }
 
     def _render_small(self):
-        """Tiny synthetic RGB note highway. Not a Clone Hero screenshot."""
+        """Render a compact perspective note highway."""
         height, width, _ = self.screen_shape
         img = np.zeros(self.screen_shape, dtype=np.uint8)
-        img[:] = (12, 15, 22)
+        img[:] = (8, 10, 17)
         center_x = width // 2
-        lane_spacing = width // 8
-        lane_x = [
-            center_x + (fret - 2) * lane_spacing
-            for fret in range(5)
-        ]
+        top_y = 0
         hit_y = int(height * 0.8125)
-        highway_left = lane_x[0] - lane_spacing // 2
-        highway_right = lane_x[-1] + lane_spacing // 2
+        top_spacing = width / 11.0
+        bottom_spacing = width / 7.0
+        top_lane_width = max(2.0, top_spacing * 0.42)
+        bottom_lane_width = max(5.0, bottom_spacing * 0.42)
         pixels_per_second = 30.0 * height / 96.0
         colors = [
             (30, 220, 70),
@@ -494,59 +492,103 @@ class GuitarHeroEnv(gym.Env):
             (20, 50, 115),
             (115, 60, 12),
         ]
-        # Hit line
-        img[hit_y:hit_y + 4, highway_left:highway_right + 1] = (
-            220, 220, 220
-        )
-        # Lane separators
-        for left, right in zip(lane_x, lane_x[1:]):
-            x = (left + right) // 2
-            img[:, x:x+1] = (45, 48, 58)
-        # Notes projected onto the highway
+
+        def depth_at(y):
+            return np.clip(
+                (y - top_y) / max(1, hit_y - top_y),
+                0.0,
+                1.0,
+            )
+
+        def lane_center(fret, depth):
+            spacing = top_spacing + depth * (bottom_spacing - top_spacing)
+            return center_x + (fret - 2) * spacing
+
+        def lane_width(depth):
+            return top_lane_width + depth * (bottom_lane_width - top_lane_width)
+
+        # Draw the tapered highway and lane separators.
+        for y in range(top_y, min(height, hit_y + 1)):
+            depth = depth_at(y)
+            spacing = top_spacing + depth * (bottom_spacing - top_spacing)
+            left = int(center_x - 2.5 * spacing)
+            right = int(center_x + 2.5 * spacing)
+            img[y, max(0, left):min(width, right + 1)] = (18, 22, 32)
+            for fret in range(1, 5):
+                x = int(lane_center(fret - 0.5, depth))
+                if 0 <= x < width:
+                    img[y, x] = (48, 52, 65)
+
+        def draw_gem(x, y, radius, color):
+            y0 = max(0, int(y - radius))
+            y1 = min(height, int(y + radius + 1))
+            x0 = max(0, int(x - radius))
+            x1 = min(width, int(x + radius + 1))
+            for row in range(y0, y1):
+                half_width = int(
+                    np.sqrt(max(0.0, radius * radius - (row - y) ** 2))
+                )
+                left = max(x0, int(x - half_width))
+                right = min(x1, int(x + half_width + 1))
+                img[row, left:right] = color
+
+        def draw_sustain(fret, start_y, end_y):
+            start_y = max(top_y, int(start_y))
+            end_y = min(hit_y, int(end_y))
+            if end_y <= start_y:
+                return
+            for row in range(start_y, end_y + 1):
+                depth = depth_at(row)
+                x = int(lane_center(fret, depth))
+                half_width = max(1, int(lane_width(depth) * 0.28))
+                img[row, max(0, x - half_width):min(width, x + half_width + 1)] = (
+                    sustain_colors[fret]
+                )
+
+        # Draw notes and their tails from farthest to nearest.
         for n in self.notes:
             if n["hit"] or n["missed"]:
                 continue
             y = int(hit_y - (n["time"] - self.time) * pixels_per_second)
-            if -5 <= y < height:
+            if top_y - 20 <= y <= height:
                 for fret, active in enumerate(n["frets"]):
                     if active:
-                        x_start = lane_x[fret] - 3
-                        x_end = lane_x[fret] + 4
-                        tail_end = int(
-                            y + n["durations"][fret] * pixels_per_second
+                        draw_sustain(
+                            fret,
+                            y,
+                            y + n["durations"][fret] * pixels_per_second,
                         )
-                        tail_start = max(0, y)
-                        tail_end = min(height - 1, tail_end)
-                        if tail_end > tail_start:
-                            img[tail_start:tail_end + 1, x_start:x_end] = (
-                                sustain_colors[fret]
-                            )
-
-                        img[max(0, y-2):min(height, y+3), lane_x[fret]-4:lane_x[fret]+5] = (
-                            colors[fret]
+                        depth = depth_at(y)
+                        draw_gem(
+                            lane_center(fret, depth),
+                            y,
+                            max(2.0, lane_width(depth) * 0.42),
+                            colors[fret],
                         )
 
-        # Render the remaining portions of sustains whose note heads were hit.
+        # Continue active sustains below the hit line.
         for sustain in self.active_sustains:
             fret = sustain["fret"]
-            tail_end = min(
-                height - 1,
-                int(
-                    hit_y
-                    + max(0.0, sustain["end_time"] - self.time)
-                    * pixels_per_second
-                ),
+            tail_end = int(
+                hit_y
+                + max(0.0, sustain["end_time"] - self.time)
+                * pixels_per_second
             )
-            if tail_end > hit_y:
-                img[hit_y + 4:tail_end + 1, lane_x[fret]-3:lane_x[fret]+4] = (
+            tail_end = min(height - 1, tail_end)
+            for row in range(hit_y, tail_end + 1):
+                x = int(lane_center(fret, 1.0))
+                half_width = max(1, int(bottom_lane_width * 0.28))
+                img[row, max(0, x - half_width):min(width, x + half_width + 1)] = (
                     sustain_colors[fret]
                 )
 
-        # Current held frets shown at bottom
-        held_top = hit_y + 8
-        for i, held in enumerate(self.current_frets):
-            if held:
-                img[held_top:height - 4, lane_x[i]-5:lane_x[i]+6] = colors[i]
+        # Draw fret receptors and the hit line.
+        for fret in range(5):
+            x = lane_center(fret, 1.0)
+            draw_gem(x, hit_y, max(2.5, bottom_lane_width * 0.48), (35, 38, 48))
+            if self.current_frets[fret]:
+                draw_gem(x, hit_y, max(2.0, bottom_lane_width * 0.38), colors[fret])
+        img[max(0, hit_y - 1):min(height, hit_y + 2), :] = (210, 210, 215)
         return img
 
     def render(self):
