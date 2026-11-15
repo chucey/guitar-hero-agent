@@ -12,25 +12,49 @@ from chart_parser2 import load_chart
 from environment2 import GuitarHeroEnv
 from prep_input import make_vision_env, prep_vision_input, prep_chart_input
 from PPOAgent import PPOTrainer, PPOAgent
+import argparse
+
+parser = argparse.ArgumentParser(description="Guitar Hero Agent Training")
+parser.add_argument("--charts_path", type=str, default=os.path.join(os.getcwd(), 'songs'), help="Path to the chart files")
+parser.add_argument("--agent_name", type=str, default=None, choices=["vision_actor_critic", "chart_actor_critic"], help="Name of the agent to use for training", required=True)
+parser.add_argument("--use_wandb", action="store_true", help="Whether to use Weights and Biases for logging")
+parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+# parser.add_argument("--training_durations", type=int, nargs='+', default=[15], help="List of training durations in seconds")
+parser.add_argument("--difficulty", type=str, default="Easy", choices=["Easy", "Medium", "Hard", "Expert"],required=True, help="List of difficulties to train on")
+args = parser.parse_args()
+
 
 cf = Config()
-seed = 42
+# just to make sure wandb run_name is set correctly based on the agent name passed in the command line
+cf.run_name = f"{args.agent_name}"  # Name of the run in Weights and Biases
+cf.agent_name = args.agent_name  # Update the agent name in the config based on the command line argument
+
+seed = args.seed
 random.seed(seed)
 np.random.seed(seed)
 
-if not cf.charts_path:
-    raise ValueError("Config.charts_path must point to the chart directory before training.")
-use_wandb = True
+if not os.path.isdir(args.charts_path):
+    raise ValueError(
+        f"Charts directory does not exist: {args.charts_path}"
+    )
 
-songs = os.listdir(os.path.join(cf.charts_path))  # list of song directories in the charts path
+use_wandb = args.use_wandb
+
+training_root = Path(args.charts_path) / "train"
+if not training_root.is_dir():
+    raise ValueError(f"Training directory does not exist: {training_root}")
+
+songs = [
+    song_path.name
+    for song_path in training_root.iterdir()
+    if song_path.is_dir()
+]
 # songs
 extension = "*.chart" # to search for chart files in the song directories
-evaluation_root = Path(cf.charts_path).parent / "eval"
+evaluation_root = Path(os.path.join(args.charts_path, 'eval'))  # path to the evaluation charts
 
-training_durations = [15,] # 30, 60, 'full']  # seconds
-difficulties = ["Easy",] # "Medium", "Hard", "Expert"]
-
-
+training_durations = [15, 30, 60, 'full']  # seconds
+difficulties = [args.difficulty] # "Medium", "Hard", "Expert"]
 
 random.shuffle(songs)
 for difficulty in difficulties:
@@ -60,21 +84,21 @@ for difficulty in difficulties:
     if difficulty == "Medium":
         resume_training_path = os.path.join(
             "checkpoints",
-            "vision" if cf.agent_name == "vision_actor_critic" else "chart",
+            "vision" if args.agent_name == "vision_actor_critic" else "chart",
             "easy",
             "best.pt",
         )
     elif difficulty == "Hard":
         resume_training_path = os.path.join(
             "checkpoints",
-            "vision" if cf.agent_name == "vision_actor_critic" else "chart",
+            "vision" if args.agent_name == "vision_actor_critic" else "chart",
             "medium",
             "best.pt",
         )
     elif difficulty == "Expert":
         resume_training_path = os.path.join(
             "checkpoints",
-            "vision" if cf.agent_name == "vision_actor_critic" else "chart",
+            "vision" if args.agent_name == "vision_actor_critic" else "chart",
             "hard",
             "best.pt",
         )
@@ -82,7 +106,7 @@ for difficulty in difficulties:
     for duration in training_durations:
         print(f"Training on difficulty: {difficulty}, duration: {duration} seconds")
         for song_dir in songs:
-            song_path = Path(os.path.join(cf.charts_path, song_dir))
+            song_path = training_root / song_dir
             chart_files = list(song_path.rglob(extension))
             if not chart_files:
                 print(f"No chart file found in {song_path}")
@@ -115,23 +139,23 @@ for difficulty in difficulties:
                     except Exception:
                         continue
 
-                print(f"Training on song: {song_file} with {cf.agent_name}")
+                print(f"Training on song: {song_file} with {args.agent_name}")
                 print(f"Vision input shape: {prep_vision_input(vision_env.reset()[0]).shape}")  # Expected: (1, 12, 192, 128)
 
-                if cf.agent_name == "vision_actor_critic":
+                if args.agent_name == "vision_actor_critic":
                     training_env = vision_env
                     state_dim = prep_vision_input(vision_env.reset()[0]).shape[1:]
-                elif cf.agent_name == "chart_actor_critic":
+                elif args.agent_name == "chart_actor_critic":
                     training_env = env
                     state_dim = prep_chart_input(env.reset()[0]).shape[1]
                 else:
-                    raise ValueError(f"Unknown agent name: {cf.agent_name}")
+                    raise ValueError(f"Unknown agent name: {args.agent_name}")
 
                 if shared_agent is None:
                     shared_agent = PPOAgent(
                         state_dim=state_dim,
                         action_dim=6,
-                        vision=cf.agent_name == "vision_actor_critic",
+                        vision=args.agent_name == "vision_actor_critic",
                         lr=cf.lr,
                         n_epochs=cf.epochs,
                         batch_size=cf.batch_size,
@@ -148,7 +172,7 @@ for difficulty in difficulties:
                     resume_from=resume_training_path,
                     use_wandb=use_wandb,
                     wandb_run=difficulty_run,
-                    vision=cf.agent_name == "vision_actor_critic",
+                    vision=args.agent_name == "vision_actor_critic",
                     device = cf.device,
                     wandb_project=cf.project_name,
                     wandb_entity=cf.wandb_entity,
