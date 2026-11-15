@@ -2,10 +2,19 @@
 Global configuration file for the Guitar Hero Agent project. This file contains various parameters and settings that can be adjusted to customize the behavior of the agent and the environment.
 '''
 import os
+import torch
 
 class Config:
     def __init__(self):
-        self.charts_path = os.path.join(os.getcwd(), 'songs')  # Path to the chart files
+        self.charts_path = os.path.join(os.getcwd(), 'songs', 'train')  # Path to the chart files
+
+        # set device
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
 
         # Weights and Biases
         ## Peter please change the agent name to your agent name.
@@ -13,7 +22,7 @@ class Config:
         
         self.wandb_entity = "DS-551"
         self.project_name = "guitar-hero-agent"
-        self.name = f"{self.agent_name}"  # Name of the run in Weights and Biases 
+        self.run_name = f"{self.agent_name}"  # Name of the run in Weights and Biases 
 
         # environment parameters
         self.dt = 0.02  # seconds per step
@@ -26,16 +35,16 @@ class Config:
         self.completion_reward=1.0
 
         # global model parameters
-        self.actor_lr = 1e-4
+        self.lr = 1e-4
         self.epochs = 5
-        self.actor_lr_decay = 0.99
+        self.lr_decay = 0.99
         self.batch_size = 32
 
         # specific model parameters
         self.image_model = {
             "input_shape": (12, 192, 128),  # a stack of 4 images, each with 3 channels (RGB)
             "num_actions": 6,  # number of possible actions (5 frets + strum)
-            "save_dir": os.path.join("models", "image", "vision_actor_critic.pth"),            
+            "save_dir": os.path.join("models", "vision", "vision_actor_critic.pth"),            
         }
 
         self.chart_model = {
