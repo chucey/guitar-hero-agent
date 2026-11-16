@@ -219,9 +219,10 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-songs/
 test_chart_parser2.py
 tests/
 wandb/
 checkpoints/
 .DS_Store
+
+/.vscode
