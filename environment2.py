@@ -22,7 +22,7 @@ class GuitarHeroEnv(gym.Env):
         segment_seconds=None,
         render_mode=None,
         sustain_reward_per_second=0.25,
-        hit_reward=1.0,
+        hit_reward=2.0,
         miss_penalty=1.0,
         wrong_strum_penalty=0.05,
         completion_reward=1.0,
@@ -100,6 +100,10 @@ class GuitarHeroEnv(gym.Env):
         self.notes_hit = 0
         self.notes_missed = 0
         self.wrong_strums = 0
+        self.strums = 0
+        self.hit_reward_total = 0.0
+        self.miss_penalty_total = 0.0
+        self.wrong_strum_penalty_total = 0.0
         self.current_frets = np.zeros(5, dtype=np.int8)
         self.active_sustains = []
         self.sustain_seconds_required = 0.0
@@ -232,6 +236,7 @@ class GuitarHeroEnv(gym.Env):
 
         # Process strum first if the player strums this frame.
         if action[5] == 1:
+            self.strums += 1
             reward += self._process_strum()
         else:
             reward += self._process_fret_changes(new_presses)
@@ -258,6 +263,7 @@ class GuitarHeroEnv(gym.Env):
 
         if note is None:
             self.wrong_strums += 1
+            self.wrong_strum_penalty_total += self.wrong_strum_penalty
             self.combo = 0
             return -self.wrong_strum_penalty
 
@@ -265,6 +271,7 @@ class GuitarHeroEnv(gym.Env):
             return self._register_hit(note)
 
         self.wrong_strums += 1
+        self.wrong_strum_penalty_total += self.wrong_strum_penalty
         self.combo = 0
         return -self.wrong_strum_penalty
 
@@ -311,6 +318,7 @@ class GuitarHeroEnv(gym.Env):
                     and self.time > note["time"] + self.hit_window):
                 note["missed"] = True
                 self.notes_missed += 1
+                self.miss_penalty_total += self.miss_penalty
                 self.combo = 0
                 reward -= self.miss_penalty
         return reward
@@ -336,6 +344,10 @@ class GuitarHeroEnv(gym.Env):
                 0.0,
                 until - sustain["paid_until"]
             )
+            elapsed = min(
+                elapsed,
+                max(0.0, sustain["end_time"] - sustain["paid_until"]),
+            )
 
             reward += (
                 elapsed * self.sustain_reward_per_second
@@ -355,6 +367,7 @@ class GuitarHeroEnv(gym.Env):
         note["hit"] = True
 
         self.notes_hit += 1
+        self.hit_reward_total += self.hit_reward
         self.combo += 1
         self.max_combo = max(self.max_combo, self.combo)
 
@@ -449,13 +462,46 @@ class GuitarHeroEnv(gym.Env):
             sustain_coverage = 1.0
             sustain_completion = 1.0
 
+        technique_categories = {
+            "regular_strum": lambda note: (
+                note["technique"] == NoteTechnique.STRUM
+                and sum(note["frets"]) <= 1
+                and not note["is_open"]
+            ),
+            "hopo": lambda note: note["technique"] == NoteTechnique.HOPO,
+            "tap": lambda note: note["technique"] == NoteTechnique.TAP,
+            "chord": lambda note: sum(note["frets"]) > 1,
+            "open_note": lambda note: note["is_open"],
+            "sustain_note": lambda note: any(
+                duration > 0 for duration in note["durations"]
+            ),
+        }
+        technique_metrics = {}
+        for category, matches in technique_categories.items():
+            category_notes = [note for note in self.notes if matches(note)]
+            category_total = len(category_notes)
+            category_hits = sum(note["hit"] for note in category_notes)
+            category_misses = sum(note["missed"] for note in category_notes)
+            technique_metrics.update({
+                f"{category}_accuracy": float(
+                    category_hits / max(category_total, 1)
+                ),
+                f"{category}_notes_hit": int(category_hits),
+                f"{category}_notes_missed": int(category_misses),
+                f"{category}_notes_total": int(category_total),
+            })
+
         return {
             "score": int(self.score),
             "combo": int(self.combo),
             "max_combo": int(self.max_combo),
             "notes_hit": int(self.notes_hit),
             "notes_missed": int(self.notes_missed),
+            "strums": int(self.strums),
             "wrong_strums": int(self.wrong_strums),
+            "hit_reward": float(self.hit_reward_total),
+            "miss_penalty": float(self.miss_penalty_total),
+            "wrong_strum_penalty": float(self.wrong_strum_penalty_total),
             "accuracy": float(self.notes_hit / total),
             "sustain_accuracy": float(sustain_coverage),
             "sustain_coverage": float(sustain_coverage),
@@ -463,6 +509,7 @@ class GuitarHeroEnv(gym.Env):
             "sustain_required_seconds": float(self.sustain_seconds_required),
             "sustain_held_seconds": float(self.sustain_seconds_held),
             "time": float(self.time),
+            **technique_metrics,
         }
 
     def _render_small(self):
@@ -519,7 +566,7 @@ class GuitarHeroEnv(gym.Env):
                 if 0 <= x < width:
                     img[y, x] = (48, 52, 65)
 
-        def draw_gem(x, y, radius, color):
+        def draw_circle(x, y, radius, color):
             y0 = max(0, int(y - radius))
             y1 = min(height, int(y + radius + 1))
             x0 = max(0, int(x - radius))
@@ -531,6 +578,42 @@ class GuitarHeroEnv(gym.Env):
                 left = max(x0, int(x - half_width))
                 right = min(x1, int(x + half_width + 1))
                 img[row, left:right] = color
+
+        def draw_ring(x, y, outer_radius, inner_radius, color):
+            y0 = max(0, int(y - outer_radius))
+            y1 = min(height, int(y + outer_radius + 1))
+            x0 = max(0, int(x - outer_radius))
+            x1 = min(width, int(x + outer_radius + 1))
+            outer_squared = outer_radius * outer_radius
+            inner_squared = inner_radius * inner_radius
+            for row in range(y0, y1):
+                for column in range(x0, x1):
+                    distance_squared = (column - x) ** 2 + (row - y) ** 2
+                    if inner_squared <= distance_squared <= outer_squared:
+                        img[row, column] = color
+
+        def draw_gem(x, y, radius, color, technique=None):
+            outline = (5, 7, 12)
+            draw_circle(x, y, radius + 1.0, outline)
+            draw_circle(x, y, radius, color)
+
+            if technique == "hopo":
+                draw_ring(
+                    x,
+                    y,
+                    radius * 0.88,
+                    radius * 0.68,
+                    (235, 235, 235),
+                )
+            elif technique == "tap":
+                draw_ring(
+                    x,
+                    y,
+                    radius * 0.88,
+                    radius * 0.68,
+                    (245, 245, 245),
+                )
+                draw_circle(x, y, radius * 0.28, (245, 245, 245))
 
         def draw_sustain(fret, start_y, end_y):
             start_y = max(top_y, int(start_y))
@@ -564,6 +647,7 @@ class GuitarHeroEnv(gym.Env):
                             y,
                             max(2.0, lane_width(depth) * 0.42),
                             colors[fret],
+                            n["technique"].value,
                         )
 
         # Continue active sustains below the hit line.
