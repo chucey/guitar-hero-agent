@@ -253,32 +253,132 @@ class PPOAgent:
 
         def evaluate(self, env, n_episodes):
                 """Evaluate the policy deterministically and return mean reward."""
-                rewards = []
+                return self.evaluate_metrics(env, n_episodes)["reward"]
 
+        def evaluate_metrics(self, env, n_episodes):
+                """Evaluate the policy and return normalized gameplay metrics."""
+                totals = {
+                        "reward": [],
+                        "episode_length": [],
+                        "accuracy": [],
+                        "notes_hit": [],
+                        "notes_missed": [],
+                        "strums": [],
+                        "score": [],
+                        "wrong_strums": [],
+                        "hit_reward": [],
+                        "miss_penalty": [],
+                        "wrong_strum_penalty": [],
+                        "sustain_coverage": [],
+                        "sustain_completion": [],
+                }
+                technique_categories = (
+                        "regular_strum",
+                        "hopo",
+                        "tap",
+                        "chord",
+                        "open_note",
+                        "sustain_note",
+                )
+                for category in technique_categories:
+                        totals[f"{category}_accuracy"] = []
+                        totals[f"{category}_notes_hit"] = []
+                        totals[f"{category}_notes_missed"] = []
                 for _ in range(n_episodes):
                         state, _ = env.reset()
                         done = False
                         total_reward = 0.0
+                        episode_length = 0
 
                         while not done:
                                 state_tensor = self._prepare_state(state)
 
                                 with torch.no_grad():
+                                        # logits, _ = self.actor_critic(state_tensor)
+                                        # action = (
+                                        #         (logits > 0.0)
+                                        #         .squeeze(0)
+                                        #         .cpu()
+                                        #         .numpy()
+                                        # )
                                         logits, _ = self.actor_critic(state_tensor)
-                                        action = (
-                                                (logits > 0.0)
-                                                .squeeze(0)
-                                                .cpu()
-                                                .numpy()
-                                        )
+                                distribution = torch.distributions.Bernoulli(logits=logits)
+                                action = (
+                                    distribution.sample()
+                                    .squeeze(0)
+                                    .cpu()
+                                    .numpy()
+                                    .astype(np.int8)
+                                )
 
-                                state, reward, terminated, truncated, _ = env.step(action)
+                                state, reward, terminated, truncated, info = env.step(action)
                                 done = terminated or truncated
                                 total_reward += reward
+                                episode_length += 1
 
-                        rewards.append(total_reward)
+                        totals["reward"].append(total_reward)
+                        totals["episode_length"].append(episode_length)
+                        totals["accuracy"].append(info.get("accuracy", 0.0))
+                        totals["notes_hit"].append(info.get("notes_hit", 0.0))
+                        totals["notes_missed"].append(info.get("notes_missed", 0.0))
+                        totals["strums"].append(info.get("strums", 0.0))
+                        totals["score"].append(info.get("score", 0.0))
+                        totals["wrong_strums"].append(info.get("wrong_strums", 0.0))
+                        totals["hit_reward"].append(info.get("hit_reward", 0.0))
+                        totals["miss_penalty"].append(info.get("miss_penalty", 0.0))
+                        totals["wrong_strum_penalty"].append(
+                                info.get("wrong_strum_penalty", 0.0)
+                        )
+                        totals["sustain_coverage"].append(
+                                info.get("sustain_coverage", 0.0)
+                        )
+                        totals["sustain_completion"].append(
+                                info.get("sustain_completion", 0.0)
+                        )
+                        for category in technique_categories:
+                                totals[f"{category}_accuracy"].append(
+                                        info.get(f"{category}_accuracy", 0.0)
+                                )
+                                totals[f"{category}_notes_hit"].append(
+                                        info.get(f"{category}_notes_hit", 0.0)
+                                )
+                                totals[f"{category}_notes_missed"].append(
+                                        info.get(f"{category}_notes_missed", 0.0)
+                                )
 
-                return float(np.mean(rewards))
+                result = {
+                        key: float(np.mean(values))
+                        for key, values in totals.items()
+                }
+                result["reward_per_step"] = result["reward"] / max(
+                        result["episode_length"], 1.0
+                )
+                result["score_per_step"] = result["score"] / max(
+                        result["episode_length"], 1.0
+                )
+                result["wrong_strums_per_step"] = result["wrong_strums"] / max(
+                        result["episode_length"], 1.0
+                )
+                result["strums_per_step"] = result["strums"] / max(
+                        result["episode_length"], 1.0
+                )
+                result["notes_hit_per_step"] = result["notes_hit"] / max(
+                        result["episode_length"], 1.0
+                )
+                result["notes_missed_per_step"] = result["notes_missed"] / max(
+                        result["episode_length"], 1.0
+                )
+                result["hit_reward_per_step"] = result["hit_reward"] / max(
+                        result["episode_length"], 1.0
+                )
+                result["miss_penalty_per_step"] = result["miss_penalty"] / max(
+                        result["episode_length"], 1.0
+                )
+                result["wrong_strum_penalty_per_step"] = (
+                        result["wrong_strum_penalty"]
+                        / max(result["episode_length"], 1.0)
+                )
+                return result
 
 
 class PPOTrainer:
@@ -295,6 +395,8 @@ class PPOTrainer:
         checkpoint_root="checkpoints",
         resume_from=None,
         checkpoint_prefix=None,
+        global_checkpoint_path=None,
+        global_best_eval_score=-float("inf"),
         **agent_kwargs,
     ):
         self.cf = cf
@@ -306,6 +408,8 @@ class PPOTrainer:
         self.checkpoint_root = Path(checkpoint_root)
         self.resume_from = resume_from
         self.checkpoint_prefix = checkpoint_prefix
+        self.global_checkpoint_path = global_checkpoint_path
+        self.global_best_eval_score = global_best_eval_score
         self.agent_kwargs = {
             key: value for key, value in agent_kwargs.items()
             if key != "agent"
@@ -349,7 +453,12 @@ class PPOTrainer:
         """
         Training loop for PPO agent.
         """
-        env = self.env
+        training_envs = (
+            list(self.env)
+            if isinstance(self.env, (list, tuple))
+            else [self.env]
+        )
+        env = training_envs[0]
         eval_envs = (
             list(self.eval_env)
             if isinstance(self.eval_env, (list, tuple))
@@ -371,6 +480,23 @@ class PPOTrainer:
             "checkpoint_prefix",
             self.checkpoint_prefix,
         )
+        global_checkpoint_path = agent_kwargs.pop(
+            "global_checkpoint_path",
+            self.global_checkpoint_path,
+        )
+        if (
+            global_checkpoint_path is not None
+            and self.global_best_eval_score == -float("inf")
+            and Path(global_checkpoint_path).exists()
+        ):
+            global_checkpoint = torch.load(
+                global_checkpoint_path,
+                map_location=self.agent.device,
+            )
+            self.global_best_eval_score = global_checkpoint.get(
+                "best_eval_reward",
+                self.global_best_eval_score,
+            )
         use_wandb = agent_kwargs.pop("use_wandb", True)
         wandb_run = agent_kwargs.pop("wandb_run", None)
         wandb_project = agent_kwargs.pop("wandb_project", "guitar-hero-agent")
@@ -378,10 +504,25 @@ class PPOTrainer:
         wandb_name = agent_kwargs.pop("wandb_name", None)
         
         if vision:
-            if isinstance(env.observation_space, gym.spaces.Dict):
-                screen_shape = env.observation_space["screen"].shape
+            def ensure_vision_env(training_env):
+                if not isinstance(training_env.observation_space, gym.spaces.Dict):
+                    raise ValueError(
+                        "vision environments must expose a 'screen' observation"
+                    )
+                screen_shape = training_env.observation_space["screen"].shape
                 if len(screen_shape) == 3:
-                    env = make_vision_env(env, stack_size=4)
+                    return make_vision_env(training_env, stack_size=4)
+                if len(screen_shape) == 4:
+                    return training_env
+                raise ValueError(
+                    "screen observation must be RGB or stacked RGB frames"
+                )
+
+            wrapped_envs = []
+            for training_env in training_envs:
+                wrapped_envs.append(ensure_vision_env(training_env))
+            training_envs = wrapped_envs
+            env = training_envs[0]
             screen_shape = env.observation_space["screen"].shape
             if len(screen_shape) != 4:
                 raise ValueError(
@@ -393,13 +534,17 @@ class PPOTrainer:
                 screen_shape[3],
             )
             eval_envs = [
-                make_vision_env(eval_env, stack_size=4)
-                if isinstance(eval_env.observation_space, gym.spaces.Dict)
-                else eval_env
+                ensure_vision_env(eval_env)
                 for eval_env in eval_envs
             ]
         elif isinstance(env.observation_space, gym.spaces.Dict):
-            env = make_chart_env(env)
+            training_envs = [
+                make_chart_env(training_env)
+                if isinstance(training_env.observation_space, gym.spaces.Dict)
+                else training_env
+                for training_env in training_envs
+            ]
+            env = training_envs[0]
             eval_envs = [
                 make_chart_env(eval_env)
                 if isinstance(eval_env.observation_space, gym.spaces.Dict)
@@ -462,7 +607,13 @@ class PPOTrainer:
             "note_accuracy": [],
             "game_score": [],
             "max_combo": [],
+            "notes_hit": [],
+            "notes_missed": [],
+            "strums": [],
             "wrong_strums": [],
+            "hit_reward": [],
+            "miss_penalty": [],
+            "wrong_strum_penalty": [],
             "sustain_completion": [],
             "episode_length": [],
 
@@ -478,6 +629,14 @@ class PPOTrainer:
             "environment_steps": [],
             "training_fps": [],
         }
+        technique_categories = (
+            "regular_strum",
+            "hopo",
+            "tap",
+            "chord",
+            "open_note",
+            "sustain_note",
+        )
         #tracking
         episode_lengths = []
         best_eval_reward = (
@@ -538,10 +697,14 @@ class PPOTrainer:
             print(f"PPO params: n_steps={self.agent.n_steps}, n_epochs={self.agent.n_epochs}, batch_size={self.agent.batch_size}")
             print("=" * 80)
         
+        last_state = None
         for iteration in range(
             start_iteration + 1,
             start_iteration + n_iterations + 1,
         ):
+            env = training_envs[
+                (iteration - start_iteration - 1) % len(training_envs)
+            ]
             state, _ = env.reset()
             done = False
             episode_reward = 0
@@ -601,30 +764,21 @@ class PPOTrainer:
                         
                 state = next_state
 
-            # Train on any rollout transitions left after the episode ends.
-            if self.agent.states:
-                update_start_time = time.perf_counter()
-                update_info = self.agent.update(next_state=state)
-                update_time = time.perf_counter() - update_start_time
-                log_update(update_info, update_time)
-
-                now = time.perf_counter()
-                elapsed = max(now - last_update_time, 1e-8)
-                fps = (total_env_steps - last_update_steps) / elapsed
-
-                training_metrics["environment_steps"].append(total_env_steps)
-                training_metrics["training_fps"].append(fps)
-
-                last_update_time = now
-                last_update_steps = total_env_steps
-
             #log gameplay metrics
             episode_lengths.append(episode_step)
             training_metrics["episode_reward"].append(episode_reward)
             training_metrics["note_accuracy"].append(info.get("accuracy", 0.0))
             training_metrics["game_score"].append(info.get("score", 0))
             training_metrics["max_combo"].append(info.get("max_combo", 0))
+            training_metrics["notes_hit"].append(info.get("notes_hit", 0))
+            training_metrics["notes_missed"].append(info.get("notes_missed", 0))
+            training_metrics["strums"].append(info.get("strums", 0))
             training_metrics["wrong_strums"].append(info.get("wrong_strums", 0))
+            training_metrics["hit_reward"].append(info.get("hit_reward", 0.0))
+            training_metrics["miss_penalty"].append(info.get("miss_penalty", 0.0))
+            training_metrics["wrong_strum_penalty"].append(
+                info.get("wrong_strum_penalty", 0.0)
+            )
             training_metrics["sustain_completion"].append(info.get("sustain_completion", 0.0))
             training_metrics["episode_length"].append(episode_step)
 
@@ -636,15 +790,73 @@ class PPOTrainer:
                 "accuracy/mean_30": float(np.mean(training_metrics["note_accuracy"][recent])),
                 "score/mean_30": float(np.mean(training_metrics["game_score"][recent])),
                 "max_combo/max_30": float(np.max(training_metrics["max_combo"][recent])),
+                "notes_hit/mean_30": float(np.mean(training_metrics["notes_hit"][recent])),
+                "notes_missed/mean_30": float(np.mean(training_metrics["notes_missed"][recent])),
+                "strums/mean_30": float(np.mean(training_metrics["strums"][recent])),
                 "wrong_strum/mean_30": float(np.mean(training_metrics["wrong_strums"][recent])),
                 "wrong_strum/max_30": float(np.max(training_metrics["wrong_strums"][recent])),
+                "reward/hit_mean_30": float(np.mean(training_metrics["hit_reward"][recent])),
+                "reward/miss_penalty_mean_30": float(
+                    np.mean(training_metrics["miss_penalty"][recent])
+                ),
+                "reward/wrong_strum_penalty_mean_30": float(
+                    np.mean(training_metrics["wrong_strum_penalty"][recent])
+                ),
                 "episode_length/mean_30": float(np.mean(episode_lengths[recent])),
                 "sustain/coverage": float(info.get("sustain_coverage", 0.0)),
                 "sustain/completion": float(info.get("sustain_completion", 0.0)),
                 "sustain/required_seconds": float(info.get("sustain_required_seconds", 0.0)),
                 "sustain/held_seconds": float(info.get("sustain_held_seconds", 0.0)),
+                "training/reward_per_step": float(
+                    episode_reward / max(episode_step, 1)
+                ),
+                "training/accuracy": float(info.get("accuracy", 0.0)),
+                "training/score_per_step": float(
+                    info.get("score", 0.0) / max(episode_step, 1)
+                ),
+                "training/wrong_strums_per_step": float(
+                    info.get("wrong_strums", 0.0) / max(episode_step, 1)
+                ),
+                "training/strums_per_step": float(
+                    info.get("strums", 0.0) / max(episode_step, 1)
+                ),
+                "training/notes_hit_per_step": float(
+                    info.get("notes_hit", 0.0) / max(episode_step, 1)
+                ),
+                "training/notes_missed_per_step": float(
+                    info.get("notes_missed", 0.0) / max(episode_step, 1)
+                ),
+                "training/hit_reward": float(info.get("hit_reward", 0.0)),
+                "training/miss_penalty": float(info.get("miss_penalty", 0.0)),
+                "training/hit_reward_per_step": float(
+                    info.get("hit_reward", 0.0) / max(episode_step, 1)
+                ),
+                "training/miss_penalty_per_step": float(
+                    info.get("miss_penalty", 0.0) / max(episode_step, 1)
+                ),
+                "training/wrong_strum_penalty": float(
+                    info.get("wrong_strum_penalty", 0.0)
+                ),
+                "training/wrong_strum_penalty_per_step": float(
+                    info.get("wrong_strum_penalty", 0.0)
+                    / max(episode_step, 1)
+                ),
+                "training/sustain_coverage": float(
+                    info.get("sustain_coverage", 0.0)
+                ),
             }
+            for category in technique_categories:
+                epoch_metrics[
+                    f"training/technique/{category}_accuracy"
+                ] = float(info.get(f"{category}_accuracy", 0.0))
+                epoch_metrics[
+                    f"training/technique/{category}_notes_hit"
+                ] = float(info.get(f"{category}_notes_hit", 0.0))
+                epoch_metrics[
+                    f"training/technique/{category}_notes_missed"
+                ] = float(info.get(f"{category}_notes_missed", 0.0))
             log_wandb(epoch_metrics)
+            last_state = state
 
 
             # Evaluate periodically
@@ -654,10 +866,21 @@ class PPOTrainer:
                     if monitor:
                         print("No held-out evaluation environment is configured.")
                 else:
-                    eval_reward = float(np.mean([
-                        self.agent.evaluate(eval_env, eval_episodes)
+                    evaluation_results = [
+                        self.agent.evaluate_metrics(eval_env, eval_episodes)
                         for eval_env in eval_envs
-                    ]))
+                    ]
+                    evaluation_metrics = {
+                        key: float(np.mean([
+                            result[key] for result in evaluation_results
+                        ]))
+                        for key in evaluation_results[0]
+                    }
+                    eval_reward = evaluation_metrics["reward"]
+                    log_wandb({
+                        f"evaluation/{key}": value
+                        for key, value in evaluation_metrics.items()
+                    })
                 
                 # Save best model
                 if np.isfinite(eval_reward) and eval_reward > best_eval_reward:
@@ -695,6 +918,23 @@ class PPOTrainer:
                         checkpoint["total_env_steps"],
                         checkpoint["best_eval_reward"],
                     )
+                global_eval_score = (
+                    evaluation_metrics["reward_per_step"]
+                    if eval_envs
+                    else float("-inf")
+                )
+                if (
+                    np.isfinite(global_eval_score)
+                    and global_eval_score > self.global_best_eval_score
+                    and global_checkpoint_path is not None
+                ):
+                    self.global_best_eval_score = global_eval_score
+                    self._save_checkpoint(
+                        global_checkpoint_path,
+                        iteration,
+                        total_env_steps,
+                        global_eval_score,
+                    )
                 
                 if monitor:
                     avg_reward = np.mean(training_metrics["episode_reward"])
@@ -703,8 +943,16 @@ class PPOTrainer:
                     print(f"Iter {iteration:4d} | Train Avg: {avg_reward:8.2f} | Acc: {avg_acc:5.1%} | "
                         f"Eval: {eval_reward:8.2f} (Best: {best_eval_reward:8.2f}) | "
                         f"Length: {avg_length:6.1f}")
+
+        # Flush only once after all songs have contributed to the rollout.
+        if self.agent.states and last_state is not None:
+            update_start_time = time.perf_counter()
+            update_info = self.agent.update(next_state=last_state)
+            update_time = time.perf_counter() - update_start_time
+            log_update(update_info, update_time)
         
-        env.close()
+        for training_env in training_envs:
+            training_env.close()
         for eval_env in eval_envs:
             eval_env.close()
         if owned_wandb_run:
