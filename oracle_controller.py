@@ -5,10 +5,10 @@ import numpy as np
 
 def oracle_action(env):
     """Return the action that should hit the next available chart note."""
-    action = np.zeros(6, dtype=np.int8)
+    fret_mask = 0
 
     for sustain in env.active_sustains:
-        action[sustain["fret"]] = 1
+        fret_mask |= 1 << sustain["fret"]
 
     candidates = [
         note
@@ -18,13 +18,14 @@ def oracle_action(env):
         and abs(env.time - note["time"]) <= env.dt / 2
     ]
     if not candidates:
-        return action
+        return np.array([fret_mask, 0], dtype=np.int64)
 
     candidate = min(candidates, key=lambda note: note["time"])
-    action[:5] = np.maximum(action[:5], candidate["frets"])
-    if candidate["technique"].value == "strum":
-        action[5] = 1
-    return action
+    for fret, active in enumerate(candidate["frets"]):
+        if active:
+            fret_mask |= 1 << fret
+    strum = int(candidate["technique"].value == "strum")
+    return np.array([fret_mask, strum], dtype=np.int64)
 
 
 def run_oracle_episode(env, seed=None):

@@ -29,9 +29,19 @@ class PPOAgent:
                      n_steps: int = 2048, 
                      batch_size: int = 64, 
                      n_epochs: int = 10,
-                     device: str = "cpu"):
+                     device: str = "cpu",
+                     action_dims=None):
 
                     self.vision = vision
+                    self.action_dims = (
+                        tuple(action_dims) if action_dims is not None else None
+                    )
+                    self.structured_action = self.action_dims is not None
+                    model_action_dim = (
+                        sum(self.action_dims)
+                        if self.structured_action
+                        else action_dim
+                    )
                     self.gamma = gamma
                     self.gae_lambda = gae_lambda
                     self.kl_coef = kl_coef
@@ -46,9 +56,13 @@ class PPOAgent:
 
                     # Initialize ActorCritic
                     if not vision:
-                        self.actor_critic = ChartActorCritic(state_dim, action_dim, hidden_dim).to(self.device)
+                        self.actor_critic = ChartActorCritic(
+                            state_dim, model_action_dim, hidden_dim
+                        ).to(self.device)
                     else:
-                        self.actor_critic = VisionActorCritic(state_dim, action_dim).to(self.device)
+                        self.actor_critic = VisionActorCritic(
+                            state_dim, model_action_dim
+                        ).to(self.device)
 
                      # Initialize optimizer
                     self.actor_critic_optimizer = torch.optim.Adam(self.actor_critic.parameters(), lr=lr)
@@ -60,6 +74,23 @@ class PPOAgent:
                     self.dones = []
                     self.values = []
                     self.log_probs = []
+
+        def _distribution(self, logits):
+                if not self.structured_action:
+                        return torch.distributions.Bernoulli(logits=logits)
+                splits = torch.split(logits, self.action_dims, dim=-1)
+                return tuple(
+                        torch.distributions.Categorical(logits=split)
+                        for split in splits
+                )
+
+        def _log_prob(self, distribution, actions):
+                if not self.structured_action:
+                        return distribution.log_prob(actions).sum(dim=-1)
+                return sum(
+                        dist.log_prob(actions[:, index])
+                        for index, dist in enumerate(distribution)
+                )
 
         def _prepare_state(self, state):
                 if self.vision:
@@ -85,11 +116,27 @@ class PPOAgent:
                 
                 with torch.no_grad():
                     action_logits, value = self.actor_critic(state_tensor)
-                    distribution = torch.distributions.Bernoulli(logits=action_logits)
-                    action_tensor = distribution.sample()
-                    log_prob = distribution.log_prob(action_tensor).sum(dim=-1)
+                    distribution = self._distribution(action_logits)
+                    if self.structured_action:
+                            action_tensor = torch.stack(
+                                    [dist.sample() for dist in distribution],
+                                    dim=-1,
+                            )
+                            log_prob = self._log_prob(
+                                    distribution,
+                                    action_tensor,
+                            )
+                    else:
+                            action_tensor = distribution.sample()
+                            log_prob = self._log_prob(
+                                    distribution,
+                                    action_tensor,
+                            )
 
-                action = action_tensor.squeeze(0).bool().cpu().numpy()
+                if self.structured_action:
+                        action = action_tensor.squeeze(0).long().cpu().numpy()
+                else:
+                        action = action_tensor.squeeze(0).bool().cpu().numpy()
                 return action, log_prob.item(), value.item()
         
 
@@ -152,7 +199,15 @@ class PPOAgent:
                     [self._prepare_state(state) for state in self.states],
                     dim=0,
                 )
-                actions_t = torch.FloatTensor(np.array(self.actions)).to(self.device)
+                actions_t = torch.as_tensor(
+                        np.array(self.actions),
+                        dtype=(
+                                torch.long
+                                if self.structured_action
+                                else torch.float32
+                        ),
+                        device=self.device,
+                )
                 old_log_probs_t = torch.FloatTensor(np.array(self.log_probs)).to(self.device)
                 advantages_t = torch.FloatTensor(advantages).to(self.device)
                 returns_t = torch.FloatTensor(returns).to(self.device)
@@ -178,9 +233,18 @@ class PPOAgent:
                         # Evaluate stored actions
                         logits, new_values = self.actor_critic(states_t[mb_idx])
                         new_values = new_values.squeeze(-1)
-                        dist = torch.distributions.Bernoulli(logits=logits)
-                        new_log_probs = dist.log_prob(actions_t[mb_idx]).sum(dim=-1)
-                        entropy = dist.entropy().sum(dim=-1).mean()
+                        dist = self._distribution(logits)
+                        new_log_probs = self._log_prob(
+                                dist,
+                                actions_t[mb_idx],
+                        )
+                        if self.structured_action:
+                                entropy = sum(
+                                        action_dist.entropy()
+                                        for action_dist in dist
+                                ).mean()
+                        else:
+                                entropy = dist.entropy().sum(dim=-1).mean()
                     
                         #Ratio and Approximate KL divergence
                         log_ratio = new_log_probs - old_log_probs_t[mb_idx]
@@ -263,11 +327,15 @@ class PPOAgent:
                         "accuracy": [],
                         "notes_hit": [],
                         "notes_missed": [],
+                        "notes_ignored": [],
+                        "notes_ignored": [],
                         "strums": [],
                         "score": [],
                         "wrong_strums": [],
                         "hit_reward": [],
                         "miss_penalty": [],
+                        "ignored_note_penalty": [],
+                        "ignored_note_penalty": [],
                         "wrong_strum_penalty": [],
                         "sustain_coverage": [],
                         "sustain_completion": [],
@@ -294,22 +362,24 @@ class PPOAgent:
                                 state_tensor = self._prepare_state(state)
 
                                 with torch.no_grad():
-                                        # logits, _ = self.actor_critic(state_tensor)
-                                        # action = (
-                                        #         (logits > 0.0)
-                                        #         .squeeze(0)
-                                        #         .cpu()
-                                        #         .numpy()
-                                        # )
                                         logits, _ = self.actor_critic(state_tensor)
-                                distribution = torch.distributions.Bernoulli(logits=logits)
-                                action = (
-                                    distribution.sample()
-                                    .squeeze(0)
-                                    .cpu()
-                                    .numpy()
-                                    .astype(np.int8)
-                                )
+                                        distribution = self._distribution(logits)
+                                        if self.structured_action:
+                                                action = np.array(
+                                                        [
+                                                                dist.sample().item()
+                                                                for dist in distribution
+                                                        ],
+                                                        dtype=np.int64,
+                                                )
+                                        else:
+                                                action = (
+                                                        distribution.sample()
+                                                        .squeeze(0)
+                                                        .cpu()
+                                                        .numpy()
+                                                        .astype(np.int8)
+                                                )
 
                                 state, reward, terminated, truncated, info = env.step(action)
                                 done = terminated or truncated
@@ -321,11 +391,15 @@ class PPOAgent:
                         totals["accuracy"].append(info.get("accuracy", 0.0))
                         totals["notes_hit"].append(info.get("notes_hit", 0.0))
                         totals["notes_missed"].append(info.get("notes_missed", 0.0))
+                        totals["notes_ignored"].append(info.get("notes_ignored", 0.0))
                         totals["strums"].append(info.get("strums", 0.0))
                         totals["score"].append(info.get("score", 0.0))
                         totals["wrong_strums"].append(info.get("wrong_strums", 0.0))
                         totals["hit_reward"].append(info.get("hit_reward", 0.0))
                         totals["miss_penalty"].append(info.get("miss_penalty", 0.0))
+                        totals["ignored_note_penalty"].append(
+                                info.get("ignored_note_penalty", 0.0)
+                        )
                         totals["wrong_strum_penalty"].append(
                                 info.get("wrong_strum_penalty", 0.0)
                         )
@@ -368,11 +442,18 @@ class PPOAgent:
                 result["notes_missed_per_step"] = result["notes_missed"] / max(
                         result["episode_length"], 1.0
                 )
+                result["notes_ignored_per_step"] = result["notes_ignored"] / max(
+                        result["episode_length"], 1.0
+                )
                 result["hit_reward_per_step"] = result["hit_reward"] / max(
                         result["episode_length"], 1.0
                 )
                 result["miss_penalty_per_step"] = result["miss_penalty"] / max(
                         result["episode_length"], 1.0
+                )
+                result["ignored_note_penalty_per_step"] = (
+                        result["ignored_note_penalty"]
+                        / max(result["episode_length"], 1.0)
                 )
                 result["wrong_strum_penalty_per_step"] = (
                         result["wrong_strum_penalty"]
@@ -772,10 +853,14 @@ class PPOTrainer:
             training_metrics["max_combo"].append(info.get("max_combo", 0))
             training_metrics["notes_hit"].append(info.get("notes_hit", 0))
             training_metrics["notes_missed"].append(info.get("notes_missed", 0))
+            training_metrics["notes_ignored"].append(info.get("notes_ignored", 0))
             training_metrics["strums"].append(info.get("strums", 0))
             training_metrics["wrong_strums"].append(info.get("wrong_strums", 0))
             training_metrics["hit_reward"].append(info.get("hit_reward", 0.0))
             training_metrics["miss_penalty"].append(info.get("miss_penalty", 0.0))
+            training_metrics["ignored_note_penalty"].append(
+                info.get("ignored_note_penalty", 0.0)
+            )
             training_metrics["wrong_strum_penalty"].append(
                 info.get("wrong_strum_penalty", 0.0)
             )
@@ -792,12 +877,18 @@ class PPOTrainer:
                 "max_combo/max_30": float(np.max(training_metrics["max_combo"][recent])),
                 "notes_hit/mean_30": float(np.mean(training_metrics["notes_hit"][recent])),
                 "notes_missed/mean_30": float(np.mean(training_metrics["notes_missed"][recent])),
+                "notes_ignored/mean_30": float(
+                    np.mean(training_metrics["notes_ignored"][recent])
+                ),
                 "strums/mean_30": float(np.mean(training_metrics["strums"][recent])),
                 "wrong_strum/mean_30": float(np.mean(training_metrics["wrong_strums"][recent])),
                 "wrong_strum/max_30": float(np.max(training_metrics["wrong_strums"][recent])),
                 "reward/hit_mean_30": float(np.mean(training_metrics["hit_reward"][recent])),
                 "reward/miss_penalty_mean_30": float(
                     np.mean(training_metrics["miss_penalty"][recent])
+                ),
+                "reward/ignored_note_penalty_mean_30": float(
+                    np.mean(training_metrics["ignored_note_penalty"][recent])
                 ),
                 "reward/wrong_strum_penalty_mean_30": float(
                     np.mean(training_metrics["wrong_strum_penalty"][recent])
@@ -826,6 +917,9 @@ class PPOTrainer:
                 "training/notes_missed_per_step": float(
                     info.get("notes_missed", 0.0) / max(episode_step, 1)
                 ),
+                "training/notes_ignored_per_step": float(
+                    info.get("notes_ignored", 0.0) / max(episode_step, 1)
+                ),
                 "training/hit_reward": float(info.get("hit_reward", 0.0)),
                 "training/miss_penalty": float(info.get("miss_penalty", 0.0)),
                 "training/hit_reward_per_step": float(
@@ -833,6 +927,13 @@ class PPOTrainer:
                 ),
                 "training/miss_penalty_per_step": float(
                     info.get("miss_penalty", 0.0) / max(episode_step, 1)
+                ),
+                "training/ignored_note_penalty": float(
+                    info.get("ignored_note_penalty", 0.0)
+                ),
+                "training/ignored_note_penalty_per_step": float(
+                    info.get("ignored_note_penalty", 0.0)
+                    / max(episode_step, 1)
                 ),
                 "training/wrong_strum_penalty": float(
                     info.get("wrong_strum_penalty", 0.0)

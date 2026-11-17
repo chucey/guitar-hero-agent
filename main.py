@@ -60,8 +60,9 @@ difficulties = [args.difficulty] # "Medium", "Hard", "Expert"]
 
 random.shuffle(songs)
 global_best_eval_score = -float("inf")
+checkpoint_root = os.path.join("checkpoints", "structured_action")
 global_checkpoint_path = os.path.join(
-    "checkpoints",
+    checkpoint_root,
     "vision" if args.agent_name == "vision_actor_critic" else "chart",
     "global_best.pt",
 )
@@ -93,21 +94,21 @@ for difficulty in difficulties:
 
     if difficulty == "Medium":
         resume_training_path = os.path.join(
-            "checkpoints",
+            checkpoint_root,
             "vision" if args.agent_name == "vision_actor_critic" else "chart",
             "easy",
             "best.pt",
         )
     elif difficulty == "Hard":
         resume_training_path = os.path.join(
-            "checkpoints",
+            checkpoint_root,
             "vision" if args.agent_name == "vision_actor_critic" else "chart",
             "medium",
             "best.pt",
         )
     elif difficulty == "Expert":
         resume_training_path = os.path.join(
-            "checkpoints",
+            checkpoint_root,
             "vision" if args.agent_name == "vision_actor_critic" else "chart",
             "hard",
             "best.pt",
@@ -179,7 +180,8 @@ for difficulty in difficulties:
         if shared_agent is None:
             shared_agent = PPOAgent(
                 state_dim=state_dim,
-                action_dim=6,
+                action_dim=2,
+                action_dims=(32, 2),
                 vision=args.agent_name == "vision_actor_critic",
                 n_steps=2048,
                 lr=3e-5,
@@ -195,6 +197,7 @@ for difficulty in difficulties:
             agent=shared_agent,
             difficulty=difficulty,
             monitor=True,
+            checkpoint_root=checkpoint_root,
             resume_from=resume_training_path,
             use_wandb=use_wandb,
             wandb_run=difficulty_run,

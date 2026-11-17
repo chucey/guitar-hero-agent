@@ -7,7 +7,7 @@ from note2 import Note, NoteTechnique
 class GuitarHeroEnv(gym.Env):
     """A small, chart-informed Guitar Hero simulator.
 
-    Actions: MultiBinary(6): desired G/R/Y/B/O fret states + one-frame strum pulse.
+    Actions: MultiDiscrete([32, 2]): five-fret mask + one-frame strum pulse.
     Observations: structured upcoming chart + current state + rendered RGB frame.
     Time advances by dt each step; simulation does not sleep in real time.
     """
@@ -22,8 +22,9 @@ class GuitarHeroEnv(gym.Env):
         segment_seconds=None,
         render_mode=None,
         sustain_reward_per_second=0.25,
-        hit_reward=2.0,
+        hit_reward=1.0,
         miss_penalty=1.0,
+        ignored_note_penalty=0.25,
         wrong_strum_penalty=0.05,
         completion_reward=1.0,
     ):
@@ -43,12 +44,11 @@ class GuitarHeroEnv(gym.Env):
         self.sustain_reward_per_second = sustain_reward_per_second
         self.hit_reward = hit_reward
         self.miss_penalty = miss_penalty
+        self.ignored_note_penalty = ignored_note_penalty
         self.wrong_strum_penalty = wrong_strum_penalty
         self.completion_reward = completion_reward
 
-        # The first five bits are persistent desired fret states.
-        # The sixth bit is a one-step strum pulse (1 on this step = strum now).
-        self.action_space = spaces.MultiBinary(6)
+        self.action_space = spaces.MultiDiscrete([32, 2])
         self.screen_shape = (192, 128, 3)  # RGB image of the note highway
         self.observation_space = spaces.Dict({
             "upcoming_notes": spaces.Box(
@@ -90,6 +90,7 @@ class GuitarHeroEnv(gym.Env):
             "is_open": note.is_open,
             "hit": False,
             "missed": False,
+            "attempted": False,
         }
 
     def reset(self, seed=None, options=None):
@@ -99,10 +100,12 @@ class GuitarHeroEnv(gym.Env):
         self.max_combo = 0
         self.notes_hit = 0
         self.notes_missed = 0
+        self.notes_ignored = 0
         self.wrong_strums = 0
         self.strums = 0
         self.hit_reward_total = 0.0
         self.miss_penalty_total = 0.0
+        self.ignored_note_penalty_total = 0.0
         self.wrong_strum_penalty_total = 0.0
         self.current_frets = np.zeros(5, dtype=np.int8)
         self.active_sustains = []
@@ -213,21 +216,17 @@ class GuitarHeroEnv(gym.Env):
 
     def step(self, action):
         if not self.action_space.contains(action):
-            raise ValueError("action must be a binary vector of shape (6,)")
+            raise ValueError("action must be [fret_mask, strum] in MultiDiscrete space")
         action = np.asarray(action, dtype=np.int8)
 
-        if (
-            action.shape != (6,)
-            or np.any((action != 0) & (action != 1))
-        ):
-            raise ValueError(
-                "action must be a binary vector of shape (6,)"
-            )
-
+        fret_mask, strum = int(action[0]), int(action[1])
         reward = 0.0
 
         previous_frets = self.current_frets.copy()
-        self.current_frets = action[:5].copy()
+        self.current_frets = np.array(
+            [(fret_mask >> fret) & 1 for fret in range(5)],
+            dtype=np.int8,
+        )
 
         new_presses = (
             (self.current_frets == 1)
@@ -235,7 +234,7 @@ class GuitarHeroEnv(gym.Env):
         )
 
         # Process strum first if the player strums this frame.
-        if action[5] == 1:
+        if strum == 1:
             self.strums += 1
             reward += self._process_strum()
         else:
@@ -267,6 +266,7 @@ class GuitarHeroEnv(gym.Env):
             self.combo = 0
             return -self.wrong_strum_penalty
 
+        note["attempted"] = True
         if np.array_equal(self.current_frets, note["frets"]):
             return self._register_hit(note)
 
@@ -280,6 +280,9 @@ class GuitarHeroEnv(gym.Env):
 
         if note is None:
             return 0.0
+
+        if np.any(self.current_frets) or np.any(new_presses):
+            note["attempted"] = True
 
         technique = note["technique"]
 
@@ -321,6 +324,10 @@ class GuitarHeroEnv(gym.Env):
                 self.miss_penalty_total += self.miss_penalty
                 self.combo = 0
                 reward -= self.miss_penalty
+                if not note["attempted"]:
+                    self.notes_ignored += 1
+                    self.ignored_note_penalty_total += self.ignored_note_penalty
+                    reward -= self.ignored_note_penalty
         return reward
 
     def _process_sustains(self):
@@ -497,10 +504,12 @@ class GuitarHeroEnv(gym.Env):
             "max_combo": int(self.max_combo),
             "notes_hit": int(self.notes_hit),
             "notes_missed": int(self.notes_missed),
+            "notes_ignored": int(self.notes_ignored),
             "strums": int(self.strums),
             "wrong_strums": int(self.wrong_strums),
             "hit_reward": float(self.hit_reward_total),
             "miss_penalty": float(self.miss_penalty_total),
+            "ignored_note_penalty": float(self.ignored_note_penalty_total),
             "wrong_strum_penalty": float(self.wrong_strum_penalty_total),
             "accuracy": float(self.notes_hit / total),
             "sustain_accuracy": float(sustain_coverage),

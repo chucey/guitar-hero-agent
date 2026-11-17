@@ -5,6 +5,26 @@ from note2 import Note, NoteTechnique
 
 
 class ActiveSustainTests(unittest.TestCase):
+    def test_unattempted_note_is_tracked_and_penalized(self):
+        song = [
+            Note(
+                time=0.2,
+                frets=(True, False, False, False, False),
+                durations=(0, 0, 0, 0, 0),
+                technique=NoteTechnique.STRUM,
+            ),
+        ]
+        env = GuitarHeroEnv(song, dt=0.1)
+        env.reset()
+
+        terminated = False
+        while not terminated:
+            _, _, terminated, _, info = env.step([0, 0])
+
+        self.assertEqual(info["notes_missed"], 1)
+        self.assertEqual(info["notes_ignored"], 1)
+        self.assertEqual(info["ignored_note_penalty"], 0.25)
+
     def test_overlapping_same_fret_sustains_are_coalesced(self):
         song = [
             Note(
@@ -104,7 +124,7 @@ class TechniqueInputTests(unittest.TestCase):
         env.reset()
         env.time = 1.0
 
-        _, reward, _, _, info = env.step([0, 1, 0, 0, 0, 0])
+        _, reward, _, _, info = env.step([2, 0])
 
         self.assertEqual(reward, env.hit_reward)
         self.assertEqual(info["notes_hit"], 1)
