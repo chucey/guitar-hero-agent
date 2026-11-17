@@ -35,7 +35,7 @@ class Config:
         self.completion_reward=1.0
 
         # global model parameters
-        self.lr = 1e-4
+        self.lr = 1e-5
         self.epochs = 5
         self.lr_decay = 0.99
         self.batch_size = 32
