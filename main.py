@@ -55,8 +55,8 @@ songs = [
 extension = "*.chart" # to search for chart files in the song directories
 evaluation_root = Path(os.path.join(args.charts_path, 'eval'))  # path to the evaluation charts
 
-training_durations = [15,] # 30, 60, 'full']  # seconds
-difficulties = [args.difficulty] # "Medium", "Hard", "Expert"]
+training_durations = [15, 20, 30, 40, 50, 60, 'full']  # seconds
+difficulties = [args.difficulty] # "Easy", "Medium", "Hard", "Expert"]
 
 random.shuffle(songs)
 global_best_eval_score = -float("inf")
