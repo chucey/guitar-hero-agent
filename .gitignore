@@ -226,3 +226,4 @@ wandb/
 checkpoints/
 .DS_Store
 logs/
+global_best.pt
