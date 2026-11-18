@@ -55,7 +55,7 @@ songs = [
 extension = "*.chart" # to search for chart files in the song directories
 evaluation_root = Path(os.path.join(args.charts_path, 'eval'))  # path to the evaluation charts
 
-training_durations = [15, 20, 30, 40, 50, 60, 'full']  # seconds
+training_durations = [15, 20, 30, 40, 50, 60,]  # seconds
 difficulties = [args.difficulty] # "Easy", "Medium", "Hard", "Expert"]
 
 random.shuffle(songs)
@@ -183,7 +183,7 @@ for difficulty in difficulties:
                 action_dim=2,
                 action_dims=(32, 2),
                 vision=args.agent_name == "vision_actor_critic",
-                n_steps=2048,
+                n_steps=4096,
                 lr=3e-5,
                 n_epochs=3,
                 batch_size=32,
