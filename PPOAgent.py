@@ -471,6 +471,8 @@ class PPOTrainer:
         env,
         agent,
         eval_env=None,
+        rehearsal_env=None,
+        rehearsal_eval_env=None,
         monitor=False,
         difficulty="unknown",
         checkpoint_root="checkpoints",
@@ -478,11 +480,15 @@ class PPOTrainer:
         checkpoint_prefix=None,
         global_checkpoint_path=None,
         global_best_eval_score=-float("inf"),
+        rehearsal_difficulty=None,
+        schedule_seed=42,
         **agent_kwargs,
     ):
         self.cf = cf
         self.env = env
         self.eval_env = eval_env
+        self.rehearsal_env = rehearsal_env
+        self.rehearsal_eval_env = rehearsal_eval_env
         self.agent = agent
         self.monitor = monitor
         self.difficulty = str(difficulty).strip().lower() or "unknown"
@@ -491,6 +497,8 @@ class PPOTrainer:
         self.checkpoint_prefix = checkpoint_prefix
         self.global_checkpoint_path = global_checkpoint_path
         self.global_best_eval_score = global_best_eval_score
+        self.rehearsal_difficulty = rehearsal_difficulty
+        self.schedule_seed = schedule_seed
         self.agent_kwargs = {
             key: value for key, value in agent_kwargs.items()
             if key != "agent"
@@ -544,6 +552,22 @@ class PPOTrainer:
             list(self.eval_env)
             if isinstance(self.eval_env, (list, tuple))
             else ([] if self.eval_env is None else [self.eval_env])
+        )
+        rehearsal_envs = (
+            list(self.rehearsal_env)
+            if isinstance(self.rehearsal_env, (list, tuple))
+            else (
+                [] if self.rehearsal_env is None else [self.rehearsal_env]
+            )
+        )
+        rehearsal_eval_envs = (
+            list(self.rehearsal_eval_env)
+            if isinstance(self.rehearsal_eval_env, (list, tuple))
+            else (
+                []
+                if self.rehearsal_eval_env is None
+                else [self.rehearsal_eval_env]
+            )
         )
         monitor = self.monitor
         agent_kwargs = {**self.agent_kwargs, **agent_kwargs}
@@ -618,6 +642,14 @@ class PPOTrainer:
                 ensure_vision_env(eval_env)
                 for eval_env in eval_envs
             ]
+            rehearsal_envs = [
+                ensure_vision_env(rehearsal_env)
+                for rehearsal_env in rehearsal_envs
+            ]
+            rehearsal_eval_envs = [
+                ensure_vision_env(rehearsal_eval_env)
+                for rehearsal_eval_env in rehearsal_eval_envs
+            ]
         elif isinstance(env.observation_space, gym.spaces.Dict):
             training_envs = [
                 make_chart_env(training_env)
@@ -631,6 +663,18 @@ class PPOTrainer:
                 if isinstance(eval_env.observation_space, gym.spaces.Dict)
                 else eval_env
                 for eval_env in eval_envs
+            ]
+            rehearsal_envs = [
+                make_chart_env(rehearsal_env)
+                if isinstance(rehearsal_env.observation_space, gym.spaces.Dict)
+                else rehearsal_env
+                for rehearsal_env in rehearsal_envs
+            ]
+            rehearsal_eval_envs = [
+                make_chart_env(rehearsal_eval_env)
+                if isinstance(rehearsal_eval_env.observation_space, gym.spaces.Dict)
+                else rehearsal_eval_env
+                for rehearsal_eval_env in rehearsal_eval_envs
             ]
 
         # Get state and action dimensions
@@ -735,19 +779,19 @@ class PPOTrainer:
         last_update_time = time.perf_counter()
         training_start_time = last_update_time
 
-        def scope_metric_names(metrics):
+        def scope_metric_names(metrics, metric_difficulty=difficulty):
             scoped = {}
             for name, value in metrics.items():
                 if "/" in name:
                     category, metric = name.split("/", 1)
-                    scoped[f"{category}/{difficulty}/{metric}"] = value
+                    scoped[f"{category}/{metric_difficulty}/{metric}"] = value
                 else:
-                    scoped[f"{difficulty}/{name}"] = value
+                    scoped[f"{metric_difficulty}/{name}"] = value
             return scoped
 
-        def log_wandb(metrics):
+        def log_wandb(metrics, metric_difficulty=difficulty):
             if use_wandb and wandb_run is not None:
-                wandb_run.log(scope_metric_names(metrics))
+                wandb_run.log(scope_metric_names(metrics, metric_difficulty))
 
         def log_update(update_info, update_time):
             training_metrics["actor_loss"].append(update_info["actor_loss"])
@@ -770,6 +814,21 @@ class PPOTrainer:
                     "performance/update_time_seconds": update_time,
                 },
             )
+
+        schedule_rng = np.random.default_rng(self.schedule_seed)
+        total_iterations = start_iteration + n_iterations
+        target_count = total_iterations
+        rehearsal_count = 0
+        if rehearsal_envs:
+            rehearsal_count = round(total_iterations * 0.30)
+            target_count -= rehearsal_count
+        episode_schedule = (
+            ["target"] * target_count
+            + ["rehearsal"] * rehearsal_count
+        )
+        schedule_rng.shuffle(episode_schedule)
+        if start_iteration:
+            episode_schedule = episode_schedule[start_iteration:]
         
         if monitor:
             Architecture = "VisionActorCritic" if vision else "ChartActorCritic"
@@ -785,8 +844,16 @@ class PPOTrainer:
             start_iteration + 1,
             start_iteration + n_iterations + 1,
         ):
-            env = training_envs[
-                (iteration - start_iteration - 1) % len(training_envs)
+            schedule_kind = episode_schedule[
+                iteration - start_iteration - 1
+            ]
+            environment_pool = (
+                rehearsal_envs
+                if schedule_kind == "rehearsal"
+                else training_envs
+            )
+            env = environment_pool[
+                (iteration - start_iteration - 1) % len(environment_pool)
             ]
             state, _ = env.reset()
             done = False
@@ -947,6 +1014,9 @@ class PPOTrainer:
                 "training/sustain_coverage": float(
                     info.get("sustain_coverage", 0.0)
                 ),
+                "training/schedule_is_rehearsal": float(
+                    schedule_kind == "rehearsal"
+                ),
             }
             for category in technique_categories:
                 epoch_metrics[
@@ -964,6 +1034,7 @@ class PPOTrainer:
 
             # Evaluate periodically
             if iteration % eval_frequency == 0:
+                evaluation_metrics = {}
                 if not eval_envs:
                     eval_reward = float("nan")
                     if monitor:
@@ -984,6 +1055,27 @@ class PPOTrainer:
                         f"evaluation/{key}": value
                         for key, value in evaluation_metrics.items()
                     })
+                if rehearsal_eval_envs:
+                    rehearsal_results = [
+                        self.agent.evaluate_metrics(
+                            rehearsal_eval_env,
+                            eval_episodes,
+                        )
+                        for rehearsal_eval_env in rehearsal_eval_envs
+                    ]
+                    rehearsal_metrics = {
+                        key: float(np.mean([
+                            result[key] for result in rehearsal_results
+                        ]))
+                        for key in rehearsal_results[0]
+                    }
+                    log_wandb(
+                        {
+                            f"evaluation/rehearsal/{key}": value
+                            for key, value in rehearsal_metrics.items()
+                        },
+                        self.rehearsal_difficulty or "rehearsal",
+                    )
                 
                 # Save best model
                 if np.isfinite(eval_reward) and eval_reward > best_eval_reward:
@@ -1058,6 +1150,10 @@ class PPOTrainer:
             training_env.close()
         for eval_env in eval_envs:
             eval_env.close()
+        for rehearsal_env in rehearsal_envs:
+            rehearsal_env.close()
+        for rehearsal_eval_env in rehearsal_eval_envs:
+            rehearsal_eval_env.close()
         if owned_wandb_run:
             wandb_run.finish()
         print(f"\nTraining completed! Best evaluation reward: {best_eval_reward:.2f}")
