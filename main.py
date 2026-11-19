@@ -55,22 +55,85 @@ songs = [
 extension = "*.chart" # to search for chart files in the song directories
 evaluation_root = Path(os.path.join(args.charts_path, 'eval'))  # path to the evaluation charts
 
-training_durations = [15, 20, 30, 40, 50, 60,]  # seconds
+training_durations = [15, 20, 30, 40, 50, 60,] # seconds
 difficulties = [args.difficulty] # "Easy", "Medium", "Hard", "Expert"]
+rehearsal_difficulty = {
+    "Medium": "Easy",
+    "Hard": "Medium",
+    "Expert": "Hard",
+}.get(args.difficulty)
 
 random.shuffle(songs)
-global_best_eval_score = -float("inf")
-checkpoint_root = os.path.join("checkpoints", "structured_action")
-global_checkpoint_path = os.path.join(
-    checkpoint_root,
-    "vision" if args.agent_name == "vision_actor_critic" else "chart",
-    "global_best.pt",
+checkpoint_root = os.path.join(
+    os.getcwd(),
+    "checkpoints",
+    "structured_action",
 )
+model_type = "vision" if args.agent_name == "vision_actor_critic" else "chart"
+
+
+def build_environments(difficulty, segment_seconds, evaluation=False):
+    """Load isolated environments for one difficulty."""
+    root = evaluation_root if evaluation else training_root
+    chart_files = sorted(root.rglob(extension))
+    if not evaluation:
+        chart_files = [
+            chart_file
+            for song_dir in songs
+            for chart_file in sorted(
+                (training_root / song_dir).rglob(extension)
+            )[:1]
+        ]
+
+    environments = []
+    first_song_file = None
+    for chart_file in chart_files:
+        try:
+            song = load_chart(chart_file, difficulty=difficulty)
+            environment = GuitarHeroEnv(
+                song,
+                segment_seconds=segment_seconds,
+            )
+            if args.agent_name == "vision_actor_critic":
+                environment = make_vision_env(environment, stack_size=4)
+            environments.append(environment)
+            if first_song_file is None:
+                first_song_file = chart_file
+        except Exception as exc:
+            print(
+                f"Failed to load {difficulty} chart {chart_file}: {exc}"
+            )
+    return environments, first_song_file
 
 for difficulty in difficulties:
     shared_agent = None
-    resume_training_path = None
     difficulty_run = None
+    difficulty_root = os.path.join(
+        checkpoint_root,
+        model_type,
+        difficulty.lower(),
+    )
+    target_latest_path = os.path.join(difficulty_root, "latest.pt")
+    target_global_path = os.path.join(difficulty_root, "global_best.pt")
+    source_path = None
+    if rehearsal_difficulty:
+        source_path = os.path.join(
+            checkpoint_root,
+            model_type,
+            rehearsal_difficulty.lower(),
+            "global_best.pt",
+        )
+    resume_training_path = (
+        target_latest_path
+        if os.path.exists(target_latest_path)
+        else source_path if source_path and os.path.exists(source_path) else None
+    )
+    if rehearsal_difficulty and resume_training_path is None:
+        raise FileNotFoundError(
+            f"No target checkpoint at {target_latest_path} and no protected "
+            f"source checkpoint at {source_path}"
+        )
+    global_best_eval_score = -float("inf")
 
     if use_wandb:
         dotenv.load_dotenv()
@@ -92,80 +155,30 @@ for difficulty in difficulties:
             },
         )
 
-    if difficulty == "Medium":
-        resume_training_path = os.path.join(
-            checkpoint_root,
-            "vision" if args.agent_name == "vision_actor_critic" else "chart",
-            "easy",
-            "best.pt",
-        )
-    elif difficulty == "Hard":
-        resume_training_path = os.path.join(
-            checkpoint_root,
-            "vision" if args.agent_name == "vision_actor_critic" else "chart",
-            "medium",
-            "best.pt",
-        )
-    elif difficulty == "Expert":
-        resume_training_path = os.path.join(
-            checkpoint_root,
-            "vision" if args.agent_name == "vision_actor_critic" else "chart",
-            "hard",
-            "best.pt",
-        )
-
     for duration in training_durations:
         print(f"Training on difficulty: {difficulty}, duration: {duration} seconds")
-        training_envs = []
-        evaluation_envs = []
-        first_song_file = None
         segment_seconds = None if duration == "full" else duration
-
-        for song_dir in songs:
-            song_path = training_root / song_dir
-            chart_files = list(song_path.rglob(extension))
-            if not chart_files:
-                print(f"No chart file found in {song_path}")
-                continue
-            song_file = chart_files[0]
-            try:
-                song = load_chart(song_file, difficulty=difficulty)
-                env = GuitarHeroEnv(song, segment_seconds=segment_seconds)
-                if args.agent_name == "vision_actor_critic":
-                    training_envs.append(make_vision_env(env, stack_size=4))
-                elif args.agent_name == "chart_actor_critic":
-                    training_envs.append(env)
-                else:
-                    raise ValueError(f"Unknown agent name: {args.agent_name}")
-            except Exception as exc:
-                print(
-                    f"Failed to train on chart {song_file} at difficulty "
-                    f"{difficulty}: {exc}"
-                )
-                continue
-
-            if first_song_file is None:
-                first_song_file = song_file
-
-        evaluation_files = (
-            sorted(evaluation_root.rglob(extension))
-            if evaluation_root.exists()
-            else []
+        training_envs, first_song_file = build_environments(
+            difficulty,
+            segment_seconds,
         )
-        for evaluation_file in evaluation_files:
-            try:
-                evaluation_song = load_chart(
-                    evaluation_file,
-                    difficulty=difficulty,
-                )
-                evaluation_envs.append(
-                    GuitarHeroEnv(
-                        evaluation_song,
-                        segment_seconds=segment_seconds,
-                    )
-                )
-            except Exception:
-                continue
+        evaluation_envs, _ = build_environments(
+            difficulty,
+            segment_seconds,
+            evaluation=True,
+        )
+        rehearsal_envs = []
+        rehearsal_evaluation_envs = []
+        if rehearsal_difficulty:
+            rehearsal_envs, _ = build_environments(
+                rehearsal_difficulty,
+                segment_seconds,
+            )
+            rehearsal_evaluation_envs, _ = build_environments(
+                rehearsal_difficulty,
+                segment_seconds,
+                evaluation=True,
+            )
 
         if not training_envs:
             print(f"No compatible training songs found for {difficulty}.")
@@ -194,6 +207,8 @@ for difficulty in difficulties:
             cf=cf,
             env=training_envs,
             eval_env=evaluation_envs,
+            rehearsal_env=rehearsal_envs,
+            rehearsal_eval_env=rehearsal_evaluation_envs,
             agent=shared_agent,
             difficulty=difficulty,
             monitor=True,
@@ -211,12 +226,14 @@ for difficulty in difficulties:
                 if first_song_file is not None
                 else "mixed"
             ),
-            global_checkpoint_path=global_checkpoint_path,
+            global_checkpoint_path=target_global_path,
             global_best_eval_score=global_best_eval_score,
+            rehearsal_difficulty=rehearsal_difficulty,
+            schedule_seed=seed + training_durations.index(duration),
         )
 
         shared_agent, metrics = trainer.train(
-            n_iterations=200,
+            n_iterations=40,
             eval_frequency=5,
             eval_episodes=15,
         )
