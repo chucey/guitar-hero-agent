@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 
-#SBATCH -p short
+#SBATCH --account=cs551
+#SBATCH -p academic
 #SBATCH -N 1
 #SBATCH -c 8
 #SBATCH --gres=gpu:1
 
 #SBATCH --job-name="GH-agent"
-#SBATCH -t 22:00:00
+#SBATCH -t 36:00:00
 #SBATCH --mem 12G
 #SBATCH --output=logs/out/slurm-%j.out
 #SBATCH --error=logs/err/slurm-%j.err
@@ -17,7 +18,10 @@ echo "===== Running job...=====" > logs/out/slurm-%j.out
 cd /home/chucey/CS551/guitar-hero-agent
 
 echo "Activating virtual environment..." > logs/out/slurm-%j.out
+
+cd /home/chucey/CS551/guitar-hero-agent
 source .venv/bin/activate
+module load cuda
 
 echo "Training Agent..." > logs/out/slurm-%j.out
  python -m main \
