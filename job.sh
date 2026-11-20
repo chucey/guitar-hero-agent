@@ -26,6 +26,6 @@ module load cuda
 echo "Training Agent..." > logs/out/slurm-%j.out
  python -m main \
 --agent_name vision_actor_critic \
---difficulty Easy \
+--difficulty Medium \
 --use_wandb
 
