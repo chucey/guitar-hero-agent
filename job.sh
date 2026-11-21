@@ -7,7 +7,7 @@
 #SBATCH --gres=gpu:1
 
 #SBATCH --job-name="GH-agent"
-#SBATCH -t 24:00:00
+#SBATCH -t 36:00:00
 #SBATCH --mem 12G
 #SBATCH --output=logs/out/slurm-%j.out
 #SBATCH --error=logs/err/slurm-%j.err
