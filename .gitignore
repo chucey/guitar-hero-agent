@@ -225,3 +225,7 @@ tests/
 wandb/
 checkpoints/
 .DS_Store
+logs/
+global_best.pt
+local_archive/
+auto_run.sh

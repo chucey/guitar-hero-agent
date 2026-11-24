@@ -6,6 +6,7 @@ import random
 import numpy as np
 import wandb
 import dotenv
+import torch
 from pathlib import Path
 from config import Config
 from chart_parser2 import load_chart
@@ -32,6 +33,7 @@ cf.agent_name = args.agent_name  # Update the agent name in the config based on 
 seed = args.seed
 random.seed(seed)
 np.random.seed(seed)
+torch.manual_seed(seed)
 
 if not os.path.isdir(args.charts_path):
     raise ValueError(
@@ -53,14 +55,85 @@ songs = [
 extension = "*.chart" # to search for chart files in the song directories
 evaluation_root = Path(os.path.join(args.charts_path, 'eval'))  # path to the evaluation charts
 
-training_durations = [15, 30, 60, 'full']  # seconds
-difficulties = [args.difficulty] # "Medium", "Hard", "Expert"]
+training_durations = [15, 20, 30, 40, 50, 60,] # seconds
+difficulties = [args.difficulty] # "Easy", "Medium", "Hard", "Expert"]
+rehearsal_difficulty = {
+    "Medium": "Easy",
+    "Hard": "Medium",
+    "Expert": "Hard",
+}.get(args.difficulty)
 
 random.shuffle(songs)
+checkpoint_root = os.path.join(
+    os.getcwd(),
+    "checkpoints",
+    "structured_action",
+)
+model_type = "vision" if args.agent_name == "vision_actor_critic" else "chart"
+
+
+def build_environments(difficulty, segment_seconds, evaluation=False):
+    """Load isolated environments for one difficulty."""
+    root = evaluation_root if evaluation else training_root
+    chart_files = sorted(root.rglob(extension))
+    if not evaluation:
+        chart_files = [
+            chart_file
+            for song_dir in songs
+            for chart_file in sorted(
+                (training_root / song_dir).rglob(extension)
+            )[:1]
+        ]
+
+    environments = []
+    first_song_file = None
+    for chart_file in chart_files:
+        try:
+            song = load_chart(chart_file, difficulty=difficulty)
+            environment = GuitarHeroEnv(
+                song,
+                segment_seconds=segment_seconds,
+            )
+            if args.agent_name == "vision_actor_critic":
+                environment = make_vision_env(environment, stack_size=4)
+            environments.append(environment)
+            if first_song_file is None:
+                first_song_file = chart_file
+        except Exception as exc:
+            print(
+                f"Failed to load {difficulty} chart {chart_file}: {exc}"
+            )
+    return environments, first_song_file
+
 for difficulty in difficulties:
     shared_agent = None
-    resume_training_path = None
     difficulty_run = None
+    difficulty_root = os.path.join(
+        checkpoint_root,
+        model_type,
+        difficulty.lower(),
+    )
+    target_latest_path = os.path.join(difficulty_root, "latest.pt")
+    target_global_path = os.path.join(difficulty_root, "global_best.pt")
+    source_path = None
+    if rehearsal_difficulty:
+        source_path = os.path.join(
+            checkpoint_root,
+            model_type,
+            rehearsal_difficulty.lower(),
+            "global_best.pt",
+        )
+    resume_training_path = (
+        target_latest_path
+        if os.path.exists(target_latest_path)
+        else source_path if source_path and os.path.exists(source_path) else None
+    )
+    if rehearsal_difficulty and resume_training_path is None:
+        raise FileNotFoundError(
+            f"No target checkpoint at {target_latest_path} and no protected "
+            f"source checkpoint at {source_path}"
+        )
+    global_best_eval_score = -float("inf")
 
     if use_wandb:
         dotenv.load_dotenv()
@@ -72,6 +145,7 @@ for difficulty in difficulties:
             config={
                 "agent_name": cf.agent_name,
                 "difficulty": difficulty,
+                "training_durations": training_durations,
                 "dt": cf.dt,
                 "hit_window": cf.hit_window,
                 "lookahead": cf.lookahead,
@@ -81,119 +155,90 @@ for difficulty in difficulties:
             },
         )
 
-    if difficulty == "Medium":
-        resume_training_path = os.path.join(
-            "checkpoints",
-            "vision" if args.agent_name == "vision_actor_critic" else "chart",
-            "easy",
-            "best.pt",
-        )
-    elif difficulty == "Hard":
-        resume_training_path = os.path.join(
-            "checkpoints",
-            "vision" if args.agent_name == "vision_actor_critic" else "chart",
-            "medium",
-            "best.pt",
-        )
-    elif difficulty == "Expert":
-        resume_training_path = os.path.join(
-            "checkpoints",
-            "vision" if args.agent_name == "vision_actor_critic" else "chart",
-            "hard",
-            "best.pt",
-        )
-
     for duration in training_durations:
         print(f"Training on difficulty: {difficulty}, duration: {duration} seconds")
-        for song_dir in songs:
-            song_path = training_root / song_dir
-            chart_files = list(song_path.rglob(extension))
-            if not chart_files:
-                print(f"No chart file found in {song_path}")
-                continue
-            song_file = chart_files[0]
-            # print(f"Training on song: {song_file}")
-            try:
-                song = load_chart(song_file, difficulty=difficulty)
-                segment_seconds = None if duration == "full" else duration
-                env = GuitarHeroEnv(song, segment_seconds=segment_seconds)
-                vision_env = make_vision_env(env, stack_size=4)
-                evaluation_envs = []
-                evaluation_files = (
-                    sorted(evaluation_root.rglob(extension))
-                    if evaluation_root.exists()
-                    else []
-                )
-                for evaluation_file in evaluation_files:
-                    try:
-                        evaluation_song = load_chart(
-                            evaluation_file,
-                            difficulty=difficulty,
-                        )
-                        evaluation_envs.append(
-                            GuitarHeroEnv(
-                                evaluation_song,
-                                segment_seconds=segment_seconds,
-                            )
-                        )
-                    except Exception:
-                        continue
+        segment_seconds = None if duration == "full" else duration
+        training_envs, first_song_file = build_environments(
+            difficulty,
+            segment_seconds,
+        )
+        evaluation_envs, _ = build_environments(
+            difficulty,
+            segment_seconds,
+            evaluation=True,
+        )
+        rehearsal_envs = []
+        rehearsal_evaluation_envs = []
+        if rehearsal_difficulty:
+            rehearsal_envs, _ = build_environments(
+                rehearsal_difficulty,
+                segment_seconds,
+            )
+            rehearsal_evaluation_envs, _ = build_environments(
+                rehearsal_difficulty,
+                segment_seconds,
+                evaluation=True,
+            )
 
-                print(f"Training on song: {song_file} with {args.agent_name}")
-                print(f"Vision input shape: {prep_vision_input(vision_env.reset()[0]).shape}")  # Expected: (1, 12, 192, 128)
+        if not training_envs:
+            print(f"No compatible training songs found for {difficulty}.")
+            continue
 
-                if args.agent_name == "vision_actor_critic":
-                    training_env = vision_env
-                    state_dim = prep_vision_input(vision_env.reset()[0]).shape[1:]
-                elif args.agent_name == "chart_actor_critic":
-                    training_env = env
-                    state_dim = prep_chart_input(env.reset()[0]).shape[1]
-                else:
-                    raise ValueError(f"Unknown agent name: {args.agent_name}")
+        first_observation, _ = training_envs[0].reset()
+        if args.agent_name == "vision_actor_critic":
+            state_dim = prep_vision_input(first_observation).shape[1:]
+        else:
+            state_dim = prep_chart_input(first_observation).shape[1]
 
-                if shared_agent is None:
-                    shared_agent = PPOAgent(
-                        state_dim=state_dim,
-                        action_dim=6,
-                        vision=args.agent_name == "vision_actor_critic",
-                        lr=cf.lr,
-                        n_epochs=cf.epochs,
-                        batch_size=cf.batch_size,
-                        device=cf.device,
-                    )
+        if shared_agent is None:
+            shared_agent = PPOAgent(
+                state_dim=state_dim,
+                action_dim=2,
+                action_dims=(32, 2),
+                vision=args.agent_name == "vision_actor_critic",
+                n_steps=4096,
+                lr=3e-5,
+                n_epochs=3,
+                batch_size=32,
+                device=cf.device,
+            )
 
-                trainer = PPOTrainer(
-                    cf=cf,
-                    env=training_env,
-                    eval_env=evaluation_envs,
-                    agent=shared_agent,
-                    difficulty=difficulty,
-                    monitor=True,
-                    resume_from=resume_training_path,
-                    use_wandb=use_wandb,
-                    wandb_run=difficulty_run,
-                    vision=args.agent_name == "vision_actor_critic",
-                    device = cf.device,
-                    wandb_project=cf.project_name,
-                    wandb_entity=cf.wandb_entity,
-                    wandb_name=f"{cf.run_name}_{difficulty.lower()}",
-                    checkpoint_prefix=Path(song_file).parent.name,
-                )
-                   
+        trainer = PPOTrainer(
+            cf=cf,
+            env=training_envs,
+            eval_env=evaluation_envs,
+            rehearsal_env=rehearsal_envs,
+            rehearsal_eval_env=rehearsal_evaluation_envs,
+            agent=shared_agent,
+            difficulty=difficulty,
+            monitor=True,
+            checkpoint_root=checkpoint_root,
+            resume_from=resume_training_path,
+            use_wandb=use_wandb,
+            wandb_run=difficulty_run,
+            vision=args.agent_name == "vision_actor_critic",
+            device=cf.device,
+            wandb_project=cf.project_name,
+            wandb_entity=cf.wandb_entity,
+            wandb_name=f"{cf.run_name}_{difficulty.lower()}",
+            checkpoint_prefix=(
+                f"{first_song_file.parent.name}_mixed"
+                if first_song_file is not None
+                else "mixed"
+            ),
+            global_checkpoint_path=target_global_path,
+            global_best_eval_score=global_best_eval_score,
+            rehearsal_difficulty=rehearsal_difficulty,
+            schedule_seed=seed + training_durations.index(duration),
+        )
 
-                shared_agent, metrics = trainer.train(
-                    n_iterations=20,
-                    eval_frequency=5,
-                    eval_episodes=5,
-                )
-                resume_training_path = None
-            
-            except Exception as exc:
-                print(
-                    f"Failed to train on chart {song_file} at difficulty "
-                    f"{difficulty}: {exc}"
-                )
-                continue
+        shared_agent, metrics = trainer.train(
+            n_iterations=100,
+            eval_frequency=5,
+            eval_episodes=15,
+        )
+        global_best_eval_score = trainer.global_best_eval_score
+        resume_training_path = None
 
     if difficulty_run is not None:
         difficulty_run.finish()
