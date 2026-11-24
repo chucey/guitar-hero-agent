@@ -233,7 +233,7 @@ for difficulty in difficulties:
         )
 
         shared_agent, metrics = trainer.train(
-            n_iterations=500,
+            n_iterations=100,
             eval_frequency=5,
             eval_episodes=15,
         )
