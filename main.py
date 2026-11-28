@@ -196,7 +196,7 @@ for difficulty in difficulties:
                 action_dim=2,
                 action_dims=(32, 2),
                 vision=args.agent_name == "vision_actor_critic",
-                n_steps=2048,
+                n_steps=duration * 50 * 4, # 50 steps per second, make an update every 4 episodes
                 lr=3e-5,
                 n_epochs=3,
                 batch_size=32,
