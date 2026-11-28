@@ -12,7 +12,7 @@
 #SBATCH --output=logs/out/slurm-%j.out
 #SBATCH --error=logs/err/slurm-%j.err
 
-set -e
+# set -e
 
 echo "===== Running job...=====" > logs/out/slurm-%j.out
 cd /home/chucey/CS551/guitar-hero-agent
